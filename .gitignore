@@ -1,0 +1,30 @@
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# Environment & secrets
+.env
+
+# Runtime data
+data/
+*.wal
+*.wal.snap
+
+# Vendored reference repos (cloned for architecture study — not part of the product)
+reference/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+gui-cookies.txt
+memory.md
+uv.lock
+docs/HANDOFF.md
+docs/PROBLEMS.md

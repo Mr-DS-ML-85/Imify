@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Imify Admin — index & pipeline</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236c8cff' stroke-width='2'%3E%3Cpath d='M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6z'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css?v=3">
+</head>
+<body>
+
+<header class="topbar">
+  <a class="logo" href="/">
+    <svg viewBox="0 0 24 24" fill="none" stroke="url(#g)" stroke-width="2" stroke-linecap="round">
+      <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6c8cff"/><stop offset="1" stop-color="#38e1c8"/></linearGradient></defs>
+      <circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>
+    </svg>
+    <span class="grad">Imify</span><span class="tag">admin</span>
+  </a>
+  <div class="spacer"></div>
+  <button class="icon-btn" id="unlock-btn" title="Store admin key for this session">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+    Unlock
+  </button>
+</header>
+
+<div class="admin-wrap">
+  <h1>Index & pipeline</h1>
+  <p class="sub" id="status-line">Waiting for admin key…</p>
+
+  <div class="stat-cards" id="stat-cards"></div>
+
+  <div class="panel">
+    <h2>Success rates <span class="pill">real numbers, no guesses</span></h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px" id="success-grid"></div>
+    <p style="color:var(--text-faint);font-size:12.5px;margin-top:12px">Search success = searches that found at least one match. Provider rate = calls that did not error (empty answers still count as ok). Indexer rate = fetches that ended up indexed.</p>
+  </div>
+
+  <div class="panel">
+    <h2>Seed queries <span class="pill">feed the crawler</span></h2>
+    <div class="add-query">
+      <input type="text" id="new-query" placeholder="e.g. aurora borealis wallpaper, macro butterfly, neon city night…">
+      <button class="btn primary" id="add-query-btn">Add queries</button>
+    </div>
+    <table>
+      <thead><tr><th>Query</th><th>State</th><th>Last run</th><th>Last count</th><th>Total</th><th></th></tr></thead>
+      <tbody id="queries-body"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>Pipeline status <span class="pill" id="pipeline-pill">–</span></h2>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:12px" id="pipeline-grid"></div>
+    <p style="color:var(--text-faint);font-size:12.5px;margin-top:14px" id="pipeline-error"></p>
+  </div>
+
+  <div class="panel">
+    <h2>Indexed images <span class="pill" id="images-pill">–</span></h2>
+    <div class="add-query" style="display:flex;gap:8px;flex-wrap:wrap">
+      <input type="text" id="image-search" placeholder="filter by URL, title or engine…" style="flex:1;min-width:220px">
+      <button class="btn" id="image-search-btn">Filter</button>
+      <input type="text" id="purge-query" placeholder="purge by URL substring (e.g. example.com)…" style="flex:1;min-width:220px">
+      <button class="btn danger" id="purge-btn">Purge</button>
+    </div>
+    <div style="max-height:360px;overflow:auto">
+    <table>
+      <thead><tr><th></th><th>ID</th><th>Engine</th><th>Source URL</th><th>pHash</th><th>Seen</th><th></th></tr></thead>
+      <tbody id="images-body"></tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Background trackers <span class="pill" id="tracks-pill">auto-update</span></h2>
+    <p class="sub" style="margin:6px 0 12px">Uploaded/new images are reverse-searched across the whole internet on a schedule (SearXNG → Google via proxify) and every new match is ingested — the index auto-updates over time.</p>
+    <div class="add-query" style="display:flex;gap:8px">
+      <button class="btn primary" id="tracks-run-btn">Run all trackers now</button>
+    </div>
+    <table>
+      <thead><tr><th>ID</th><th>Image</th><th>pHash</th><th>Last run</th><th>Hits</th><th>Note</th><th></th></tr></thead>
+      <tbody id="tracks-body"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>API keys <span class="pill">SHA-256 hashed at rest</span></h2>
+    <div class="key-row">
+      <input type="text" id="key-name" placeholder="key name (e.g. ci-bot)">
+      <select id="key-role"><option value="user">user</option><option value="admin">admin</option></select>
+      <button class="btn primary" id="create-key-btn">Create key</button>
+    </div>
+    <div class="key-reveal" id="key-reveal" hidden></div>
+    <table>
+      <thead><tr><th>Name</th><th>Role</th><th>Created</th><th></th></tr></thead>
+      <tbody id="keys-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<div class="footer"><b>Imify</b> — admin panel. Protect this page: it controls the whole pipeline.</div>
+
+<script src="/static/admin.js?v=3"></script>
+</body>
+</html>

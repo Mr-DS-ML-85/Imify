@@ -1,0 +1,59 @@
+# SearXNG configuration for Imify.
+# https://docs.searxng.org/admin/settings/settings.html
+#
+# Imify talks to this instance over the JSON API only (no UI needed).
+# Image discovery uses the `images` category; live reverse search uses the
+# `image_url` parameter (supported by engines like Bing Images).
+
+use_default_settings: true
+
+server:
+  # CHANGE ME in production: `openssl rand -hex 32`
+  secret_key: "imify-searxng-secret-change-me"
+  # Enable once you expose SearXNG publicly (requires the limiter + redis):
+  #   limiter: true
+  limiter: false
+  public_instance: false
+  base_url: http://localhost:8080/
+
+search:
+  formats:
+    - html
+    - json
+
+# Imify's own client throttles itself (SEARXNG_QUERY_INTERVAL), so the
+# engine can stay fully permissive for the local pipeline.
+
+# Explicitly enable the image engines that power discovery + live reverse.
+# More engines = more candidate images for Imify's own perceptual-hash
+# matcher to verify (Google itself limits face results; our matcher does not).
+engines:
+  - name: bing images
+    engine: bing
+    shortcut: bi
+    disabled: false
+    categories: images
+  - name: google images
+    engine: google
+    shortcut: gi
+    disabled: false
+    categories: images
+  - name: duckduckgo images
+    engine: duckduckgo
+    shortcut: ddi
+    disabled: false
+    categories: images
+  - name: yahoo images
+    engine: yahoo
+    shortcut: yi
+    disabled: false
+    categories: images
+  - name: brave images
+    engine: brave
+    shortcut: bri
+    disabled: false
+    categories: images
+  - name: bing
+    engine: bing
+    shortcut: b
+    disabled: true

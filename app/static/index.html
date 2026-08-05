@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Imify — Reverse image search on your own stack</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236c8cff' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m21 21-4.3-4.3'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/app.css?v=3">
+</head>
+<body>
+
+<header class="topbar">
+  <a class="logo" href="/">
+    <svg viewBox="0 0 24 24" fill="none" stroke="url(#g)" stroke-width="2" stroke-linecap="round">
+      <defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6c8cff"/><stop offset="1" stop-color="#38e1c8"/></linearGradient></defs>
+      <circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>
+    </svg>
+    <span class="grad">Imify</span><span class="tag">reverse image search</span>
+  </a>
+  <div class="spacer"></div>
+  <div class="stat"><b id="stat-images">–</b><span>images indexed</span></div>
+  <button class="icon-btn" id="history-btn" title="Recent searches">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 3"/></svg>
+    History
+  </button>
+  <a class="icon-btn" href="/admin" title="Admin panel">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6z"/></svg>
+    Admin
+  </a>
+</header>
+
+<section class="hero" id="hero">
+  <h1>Find where this <span class="grad">image</span> appears.</h1>
+  <p>Self-hosted reverse image search — your own index, built by your own pipeline. No third-party APIs, no per-query fees, no data leaving your infrastructure.</p>
+</section>
+
+<div id="search-area">
+  <div class="dropzone" id="dropzone">
+    <svg class="dz-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">
+      <rect x="3" y="3" width="18" height="18" rx="3"/><circle cx="9" cy="9" r="2"/><path d="m21 15-4.5-4.5L7 20"/>
+    </svg>
+    <div class="dz-title">Drop an image here to search</div>
+    <div class="dz-sub">or click to browse your files</div>
+    <div class="dz-hint">Tip: press <kbd>Ctrl</kbd>+<kbd>V</kbd> to paste an image from your clipboard</div>
+    <input type="file" id="file-input" accept="image/*" hidden>
+  </div>
+  <div class="url-row">
+    <input type="text" id="url-input" placeholder="…or paste an image URL and press Enter">
+    <button id="url-go">Search</button>
+    <label class="learn-toggle" title="When on, verified web matches are saved into your own index (grows storage). Off = on-the-fly matching only.">
+      <input type="checkbox" id="learn-toggle">
+      <span>Learn matches</span>
+    </label>
+  </div>
+</div>
+
+<div id="results-area" hidden>
+  <div class="results-head">
+    <img class="qimg" id="query-img" alt="query image">
+    <div class="meta">
+      <h2 id="results-title">Results</h2>
+      <p id="results-sub"></p>
+    </div>
+    <div class="tabs" id="tabs">
+      <button class="tab active" data-mode="best">Best match</button>
+      <button class="tab" data-mode="color">Color</button>
+      <button class="tab" data-mode="biggest">Biggest</button>
+      <button class="tab" data-mode="newest">Newest</button>
+      <button class="tab" data-mode="changed">Most changed</button>
+    </div>
+  </div>
+  <div class="grid" id="grid"></div>
+</div>
+
+<div id="searching" class="searching" hidden>
+  <div class="spinner"></div>
+  <div>Searching the index…</div>
+</div>
+
+<div id="empty-state" class="empty" hidden>
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+  <h3>No matches in the index yet</h3>
+  <p>The index grows as the crawler discovers images. Add seed queries from the Admin panel.</p>
+</div>
+
+<div id="toasts"></div>
+
+<div class="footer" id="footer">
+  <b>Imify</b> — running on your own SearXNG + StrikeDB stack.<br>
+  Index freshness is maintained by the continuous crawler. <span id="backend-info"></span>
+</div>
+
+<script src="/static/app.js?v=3"></script>
+</body>
+</html>

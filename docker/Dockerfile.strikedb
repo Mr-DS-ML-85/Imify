@@ -1,0 +1,18 @@
+# Build context: the StrikeDB repository checkout (e.g. ./reference/StrikeDB).
+# Pure stdlib Rust -> zero external crates -> fast, reproducible build.
+FROM rust:1-slim AS build
+WORKDIR /src
+COPY . .
+# Raise fd limit note: the runtime service handles that via ulimits.
+RUN cargo build --release --bin dbstrike
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/dbstrike /usr/local/bin/dbstrike
+RUN mkdir -p /data
+VOLUME ["/data"]
+# dbstrike <addr> — WAL lives under the data volume.
+ENV DBSTRIKE_WAL=/data/dbstrike.wal
+EXPOSE 6380
+CMD ["dbstrike", "0.0.0.0:6380"]

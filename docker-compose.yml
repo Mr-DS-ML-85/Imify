@@ -1,0 +1,139 @@
+# Imify — full production stack.
+#
+#   cp .env.example .env        # then edit secrets
+#   docker compose up -d --build
+#
+# Services:
+#   strikerdb  your own DB (builds from the StrikeDB checkout you cloned)
+#   searxng    free, self-hosted image discovery + live reverse search
+#   app        FastAPI gateway (search API + UI)
+#   worker     indexing pipeline (optional separate process)
+#
+# NOTE on strikerdb: `build.context` points at ../reference/StrikeDB (the
+# checkout of YOUR repository). If that directory is missing, publish the
+# image first (`docker build -f docker/Dockerfile.strikedb reference/StrikeDB`)
+# or point `image:` at your own registry build.
+
+name: imify
+
+services:
+  strikerdb:
+    image: imify/strikedb:local
+    build:
+      context: ../reference/StrikeDB
+      dockerfile: ../docker/Dockerfile.strikedb
+    environment:
+      DBSTRIKE_WAL: /data/dbstrike.wal
+      DBSTRIKE_PASS: ${STRIKEDB_PASS:-}
+    volumes:
+      - strikerdb-data:/data
+    ports:
+      - "${STRIKEDB_PORT:-6008}:6008"
+    ulimits:
+      nofile:
+        soft: 100000
+        hard: 100000
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 bash -c 'cat < /dev/null > /dev/tcp/127.0.0.1/6008' || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest
+    environment:
+      SEARXNG_BASE_URL: http://localhost:${SEARXNG_PORT:-8080}/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-imify-searxng-secret-change-me}
+      SEARXNG_SINGLE_USER: ${SEARXNG_SINGLE_USER:-admin:admin}
+    volumes:
+      - ./deploy/searxng/settings.yml:/etc/searxng/settings.yml:ro
+    ports:
+      - "${SEARXNG_PORT:-8080}:8080"
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${GATEWAY_WORKERS:-2}
+    environment:
+      STORAGE_BACKEND: strikedb
+      STRIKEDB_HOST: strikerdb
+      STRIKEDB_PORT: "6008"
+      STRIKEDB_PASS: ${STRIKEDB_PASS:-}
+      SEARXNG_URL: http://searxng:8080
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      BOOTSTRAP_ADMIN_KEY: ${BOOTSTRAP_ADMIN_KEY:?set BOOTSTRAP_ADMIN_KEY in .env}
+      AUTH_MODE: ${AUTH_MODE:-open}
+      INDEXER_RUN_INLINE: "false"
+      INDEXER_ENABLED: "true"
+      REVERSE_PROVIDERS: ${REVERSE_PROVIDERS:-searxng,google}
+      PROXIFY_FETCH_URL: ${PROXIFY_FETCH_URL:-}
+      PROXIFY_USE_BROWSER: ${PROXIFY_USE_BROWSER:-true}
+      AUTO_TRACK_SEARCHES: ${AUTO_TRACK_SEARCHES:-true}
+      TRACKER_INTERVAL_SECONDS: ${TRACKER_INTERVAL_SECONDS:-3600}
+      DATA_DIR: /data
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-60}
+    volumes:
+      - imify-data:/data
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    depends_on:
+      strikerdb:
+        condition: service_started
+      searxng:
+        condition: service_started
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.app
+    command: python -m app.worker
+    environment:
+      STORAGE_BACKEND: strikedb
+      STRIKEDB_HOST: strikerdb
+      STRIKEDB_PORT: "6008"
+      STRIKEDB_PASS: ${STRIKEDB_PASS:-}
+      SEARXNG_URL: http://searxng:8080
+      SEARXNG_QUERY_INTERVAL: ${SEARXNG_QUERY_INTERVAL:-5}
+      REVERSE_PROVIDERS: ${REVERSE_PROVIDERS:-searxng,google}
+      PROXIFY_FETCH_URL: ${PROXIFY_FETCH_URL:-}
+      PROXIFY_USE_BROWSER: ${PROXIFY_USE_BROWSER:-true}
+      TRACKER_INTERVAL_SECONDS: ${TRACKER_INTERVAL_SECONDS:-3600}
+      DATA_DIR: /data
+      INDEXER_FETCH_WORKERS: ${INDEXER_FETCH_WORKERS:-4}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - imify-data:/data
+    depends_on:
+      strikerdb:
+        condition: service_started
+      searxng:
+        condition: service_started
+    restart: unless-stopped
+
+  # Optional: your proxify anti-bot gateway (https://github.com/Mr-DS-ML-85/proxify).
+  # Uncomment to give the Google reverse provider its unblocking fetch layer.
+  # NOTE: proxify's default API port is 8080, which searxng owns here — move it
+  # to 8081 and set PROXIFY_FETCH_URL=http://proxify:8081 in .env. The CONNECT
+  # proxy stays on 8888.
+  # proxify:
+  #   image: proxify:local
+  #   build:
+  #     context: ../reference/proxify
+  #     dockerfile: proxy-orchestrator/Dockerfile
+  #   environment:
+  #     API_PORT: "8081"
+  #     PROXY_PORT: "8888"
+  #   ports:
+  #     - "8081:8081"
+  #     - "8888:8888"
+  #   restart: unless-stopped
+
+volumes:
+  strikerdb-data:
+  imify-data:
