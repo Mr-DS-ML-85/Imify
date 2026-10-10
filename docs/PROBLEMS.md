@@ -43,7 +43,7 @@ the FB logo (the most-indexed image on the internet). User: "thats impossible i 
 `<form>` with the file, returns the raw `/search?vsrid=…` page (proxify `4beae68`); block markers
 are matched outside inline script bodies; Imify `parse_lens_results` extracts
 `["thumb",h,w],["image",h,w] … "2003":[null,id,"page","title"]` records; Google engine tries the
-in-page route first (Imify `70e5b25`, `ac3694e`).
+in-page route first (Imify `642e513`, `f25435a`).
 
 **Verified**: two uncached `/v1/search` runs → 7 and 6 verified `google lens` matches (WSJ, Reuters,
 BBC, PCMag…) in ~18 s; Google not degraded.

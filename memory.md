@@ -97,7 +97,7 @@ Not touched — needs the user's go-ahead (fix the unit's paths to `/run/media/i
 - Imify: `app/proxify.py` raw-bytes fallback downloader for refused candidates / `image_url` (403/429…);
   `parse_lens_results` (Lens "2003" records → page, title, image, thumb); Google engine order = proxify
   in-page upload → impersonated tunnel; a zero-match page is logged (size / lens records / sorry).
-  Verified: 2 uncached searches → 7 and 6 verified `google lens` matches, ~18 s. Commits `70e5b25`, `ac3694e`.
+  Verified: 2 uncached searches → 7 and 6 verified `google lens` matches, ~18 s. Commits `642e513`, `f25435a`.
 - Mounted proxify files (start_proxify.sh, `:ro`): strategies/gui_chrome.py, strategies/base.py,
   engine/decision_engine.py, **engine/js_challenge_solver.py (new)**, gateway/rest_api.py,
   scripts/gui_browser.sh. Edit in reference/proxify, then `docker restart proxy-orchestrator`
