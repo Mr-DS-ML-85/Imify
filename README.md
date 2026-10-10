@@ -119,6 +119,83 @@ docker run -d -p 8080:8080 -v "$PWD/deploy/searxng/settings.yml:/etc/searxng/set
 STORAGE_BACKEND=sqlite uv run uvicorn app.main:app --port 8000
 ```
 
+## Running StrikeDB + Proxify (the live stack)
+
+Imify needs two services of your own next to it. Both have idempotent start
+scripts (safe to run repeatedly; they do nothing if the service is up).
+
+### StrikeDB — storage + vector search (`127.0.0.1:6008`)
+
+```bash
+scripts/start_strikedb.sh
+redis-cli -p 6008 PING          # -> PONG
+redis-cli -p 6008 DBSIZE        # number of keys (images, trackers, caches…)
+```
+
+- Binary: `reference/StrikeDB/target/release/dbstrike` (build with
+  `cd reference/StrikeDB && cargo build --release --bin dbstrike`).
+- Data: `data/dbstrike.wal` (keep `data/dbstrike.wal.bak` as a backup).
+- **CPU-only:** the script sets `DBSTRIKE_GPU=cpu`, so the GPU is never
+  touched. The binary still *links* `libnvrtc.so.12`; the script puts a
+  symlink to one copy of that file in `data/lib/` (only that file, nothing
+  else from a CUDA toolkit). If it is missing, point the symlink at any
+  `libnvrtc.so.12` on the machine.
+- Talk to it like Redis: `redis-cli -p 6008 KEYS 'img:meta:*'`.
+
+### Proxify — anti-bot fetch gateway (`127.0.0.1:8081` API, `:8888` tunnel)
+
+```bash
+scripts/start_proxify.sh              # start (or no-op if running)
+scripts/start_proxify.sh --recreate   # rebuild the container from the image
+curl -s http://127.0.0.1:8081/health
+curl -s http://127.0.0.1:8081/cookies/status
+```
+
+- Runs the existing `proxy-orchestrator-orchestrator:latest` image (build it
+  from your proxify checkout with `docker compose build` in
+  `proxy-orchestrator/`). Joins the `proxy-orchestrator_default` network
+  with `proxy-redis` and `proxy-flaresolverr`.
+- Bound to `127.0.0.1` only, so the tunnel is never an open proxy on your LAN.
+- **Browser profile** lives in the docker volume `proxify-gui-profile`, so
+  cookies, cache and trust survive `--recreate`. Stale Chromium lock files
+  from an old container are cleared automatically.
+- **Cookies:** the script builds `data/proxify-cookies.txt` from
+  `gui-cookies.txt` with `scripts/filter_cookies.py`, keeping ONLY
+  search-engine and Facebook domains. Never mount the full export: it
+  contains every logged-in site in your browser. Refresh cookies by
+  re-exporting `gui-cookies.txt`, then `scripts/start_proxify.sh --recreate`.
+  `/v1/stats` → `cookies` shows live/expired counts per domain.
+- **One honest identity:** the browser is Chromium on Linux, so the script
+  sets the persona (UA + client hints) to exactly that. Faking Windows from a
+  Linux browser is a contradiction anti-bot systems score as automation.
+- **Native network stack:** `GUI_TLS_MITM=false` (default in the script)
+  lets Chrome connect to sites itself (its own TLS, HTTP/2, QUIC). Set
+  `GUI_TLS_MITM=true` to route it through proxify's TLS-impersonating MITM.
+
+### Engine politeness (why Imify won't get your IP banned)
+
+`app/engine_guard.py` paces every engine call (Google ≥ 12 s apart, Yandex
+4 s, Bing 3 s, with jitter), recognizes CAPTCHA / "unusual traffic" / 403 /
+429 answers, and **rests** a blocked engine (10 min, doubling up to 6 h)
+instead of retrying through it. Other engines carry the search meanwhile.
+Check the state in `/v1/stats` → `engine_guard`; a resting engine shows up
+in a search's `degraded` list as `cooldown:<engine>`.
+
+If Google answers *"Our systems have detected unusual traffic from your
+computer network"* (`/sorry`), that flag is on your **IP address**, not the
+browser. Nothing client-side clears it; only quiet time does (hours to a
+day). Let the guard keep Google resting, and check with your normal browser:
+if it shows the same page, it is purely the IP.
+
+### The service
+
+```bash
+systemctl --user restart imify.service    # starts StrikeDB + proxify first
+systemctl --user status imify.service
+tail -f data/app-8010.log
+curl -s http://127.0.0.1:8010/health/ready
+```
+
 ## API
 
 | Endpoint | Auth | Description |

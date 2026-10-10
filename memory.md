@@ -73,6 +73,10 @@ Not touched — needs the user's go-ahead (fix the unit's paths to `/run/media/i
   cooldown 10min→6h persisted in storage (`eg:*`), google daily budget; wired into live byte-uploads, tracker uploads
   and text-discovery browser retries; `/v1/stats.engine_guard` shows state; skipped engines appear as `cooldown:<engine>`.
   BrowserPilot's solve_captcha is deliberately NOT used.
+- Google /sorry persisted after persona fix AND after removing the TLS MITM (GUI_TLS_MITM=false, native Chrome
+  network — the user's ORIGINAL Aug-4 setup had no MITM) → it is an IP-level flag; only quiet time clears it.
+  Dropped proxify stashes pinned as branches `recovered/stash-*` in reference/proxify (branch native-network-stealth
+  holds the gui_chrome/gui_browser/brave_cookies fixes, not pushed).
 - Profile volume gotcha: stale Chromium SingletonLock from an old container hostname blocks GUI Chrome —
   start_proxify.sh clears it before launch.
 

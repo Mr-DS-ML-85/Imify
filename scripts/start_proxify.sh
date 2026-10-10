@@ -36,7 +36,9 @@ docker run -d --name "$NAME" --network proxy-orchestrator_default \
   -e LOG_LEVEL=INFO \
   -e PERSONA_UA="$PERSONA_UA" -e PERSONA_PLATFORM='"Linux"' -e PERSONA_PLATFORM_VERSION=6.8.0 \
   -e PERSONA_SEC_CH_UA="$PERSONA_SEC_CH_UA" \
-  -v "$PWD/reference/proxify/proxy-orchestrator/strategies/gui_chrome.py:/app/strategies/gui_chrome.py:ro" -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright -e TZ=UTC \
+  -e GUI_TLS_MITM="${GUI_TLS_MITM:-false}" \
+  -v "$PWD/reference/proxify/proxy-orchestrator/strategies/gui_chrome.py:/app/strategies/gui_chrome.py:ro" \
+  -v "$PWD/reference/proxify/proxy-orchestrator/scripts/gui_browser.sh:/app/scripts/gui_browser.sh:ro" -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright -e TZ=UTC \
   -v proxify-gui-profile:/app/gui-profile \
   $( [ -f "$COOKIES" ] && echo "-v $COOKIES:/app/gui-cookies.txt:ro -e COOKIE_FILE=/app/gui-cookies.txt" ) \
   --shm-size 1g --init --restart unless-stopped "$IMAGE" >/dev/null
