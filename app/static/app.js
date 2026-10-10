@@ -178,7 +178,14 @@ function renderResults(data, queryThumb) {
   const deg = data.degraded || [];
   if (deg.length) degradedLine = ` · <span style="color:var(--warn)">${deg.map((d) => d.replace(/_/g, " ").replace("provider:", "")).join(", ")}</span>`;
   const cachedLine = data.cached ? ` · <span class="badge near" title="These matches were served from the verified-results cache — no fresh web crawl was needed">cached</span>` : "";
-  $("#results-sub").innerHTML = `${data.took_ms} ms · ${providerBadges}${degradedLine}${cachedLine}`;
+  // Lens-style "best guess" + which text engines it was searched on
+  let guessLine = "";
+  if (data.best_guess) {
+    const engs = Object.entries((data.discovery && data.discovery.engines) || {}).filter(([, n]) => n > 0).map(([e]) => e);
+    guessLine = `<br>Best guess: <b>${escapeHtml(data.best_guess)}</b>` +
+      (engs.length ? ` <span title="${escapeAttr(engs.join(", "))}">· searched on ${engs.length} image engine${engs.length === 1 ? "" : "s"}</span>` : "");
+  }
+  $("#results-sub").innerHTML = `${data.took_ms} ms · ${providerBadges}${degradedLine}${cachedLine}${guessLine}`;
   state.currentResults = results;
   state.lastData = data;
   state.lastQueryThumb = queryThumb;

@@ -51,11 +51,13 @@ from app.ai import AiClient
 from app.clip import Clipper
 from app.enhance import Enhancer
 from app.config import Settings
+from app.cookies import cookie_health
 from app.engines import run_reverse_chain
 from app.engines.bing_images import BingImagesReverse
+from app.engines.text_images import TextImageDiscovery, derive_queries, is_iconlike
 from app.engines.google_images import GoogleImagesReverse
 from app.engines.yandex_images import YandexImagesReverse
-from app.features import decode_image, extract_features
+from app.features import decode_image, extract_features, hash_variants
 from app.face import FaceId
 from app.indexer import Indexer, local_pixels
 from app.logging import child_logger
@@ -82,6 +84,7 @@ def build_api(
     face: FaceId | None = None,
     clip: Clipper | None = None,
     enhancer: Enhancer | None = None,
+    text_discovery: TextImageDiscovery | None = None,
 ) -> APIRouter:
     router = APIRouter()
     ai = ai or AiClient(
@@ -220,6 +223,42 @@ def build_api(
 
         out.sort(key=lambda r: (MATCH_FAMILY_RANK.get(r.match_type, 3), -r.score))
         return out[: limit * 3]
+
+    text_discovery = text_discovery or TextImageDiscovery(
+        settings.searxng_url,
+        proxify_fetch_url=settings.proxify_fetch_url,
+        timeout=settings.searxng_timeout_seconds,
+        engines=[e.strip() for e in settings.text_discovery_engines.split(",") if e.strip()] or None,
+        browser_fallback_max=settings.text_discovery_browser_max,
+    )
+
+    def _text_discover(hits: list, img, phase_start: float) -> tuple[list, str, dict]:
+        """Lens-style expansion of the reverse hits: best-guess query from
+        their titles -> SearXNG image/icon engines (+ browser retry) ->
+        extra candidates for the SAME verifier. Bounded so verification
+        keeps its share of the web budget."""
+        if not (settings.text_discovery_enabled and text_discovery.available):
+            return [], "", {}
+        remaining = settings.web_phase_budget_seconds - (time.monotonic() - phase_start)
+        budget = min(settings.text_discovery_budget_seconds, remaining - 4.0)
+        if budget < 1.5:
+            return [], "", {"skipped": "no budget left"}
+        queries = derive_queries(hits)
+        if not queries:
+            return [], "", {"skipped": "no best guess"}
+        icons = settings.text_discovery_icons
+        include_icons = icons == "always" or (icons == "auto" and is_iconlike(img))
+        report = text_discovery.search(queries, include_icons=include_icons, budget_seconds=budget)
+        for eng, n in report.engines.items():
+            repo.record_provider(f"text:{eng}", ok=n > 0)
+        info = {
+            "queries": report.queries,
+            "engines": report.engines,
+            "blocked": report.blocked,
+            "browser_used": report.browser_used,
+            "icons": include_icons,
+        }
+        return report.hits, queries[0], info
 
     google = google or GoogleImagesReverse(settings.proxify_fetch_url)
     bing = bing or BingImagesReverse(
@@ -364,6 +403,11 @@ def build_api(
                 "images_embedded": sum(1 for m in repo.all_images() if m.clip_embedding),
                 "images": repo.image_count(),
             },
+            "cookies": cookie_health(settings.cookie_file),
+            "facebook_resolution": {
+                "enabled": settings.facebook_resolution_enabled,
+                **repo.provider_stats().get("facebook-render", {}),
+            },
             "enhance": {
                 "enabled": enhancer.enabled,
                 "available": enhancer.available,
@@ -497,6 +541,9 @@ def build_api(
         # "similar"), faces (FaceCheck identity), pixels for geometry.
         ai_img = (_enh_img or img) if enhance_info else img
         if ai_img is not None:
+            # rotated / mirrored re-uploads (phone photos) hash differently —
+            # match against the query in all 8 orientations
+            query_features["variants"] = hash_variants(ai_img)
             if clip.available:
                 query_clip = clip.embed_image(ai_img)
             if face.available:
@@ -557,6 +604,8 @@ def build_api(
         similar_web: list[SearchResult] = []  # CLIP leads (Google-Lens "similar")
         unverified_web: list[SearchResult] = []
         web_cached = False
+        best_guess = ""
+        discovery: dict = {}
         fallback = "local"
         # TinEye ladder: local index first (instant) — but the web layer ALWAYS
         # runs too (bounded + cached) so known images still surface remote
@@ -614,6 +663,16 @@ def build_api(
                     # fused-hash matcher judges each candidate afterwards.
                     up_name = (file.filename if file else None) or "image.jpg"
                     up_type = (file.content_type if file else None) or "image/jpeg"
+                    up_bytes = query_bytes
+                    # Engines decode only JPEG/PNG reliably — Bing silently
+                    # answers a WebP/AVIF/HEIC upload with unrelated generic
+                    # results. Re-encode anything else as JPEG for the engines.
+                    if img is not None and (getattr(img, "format", None) or _sniff_format(query_bytes)) not in ("JPEG", "PNG"):
+                        _buf = io.BytesIO()
+                        img.convert("RGB").save(_buf, format="JPEG", quality=92)
+                        up_bytes = _buf.getvalue()
+                        up_name = Path(up_name).stem + ".jpg"
+                        up_type = "image/jpeg"
                     # SearXNG is URL-based (no raw-byte upload), so hand it a
                     # copy the app itself serves back to it over loopback
                     # (SearXNG and the app both run on this box). Empty when no
@@ -624,7 +683,7 @@ def build_api(
                         local_url = f"{str(request.base_url).rstrip('/')}/uploads/{_persist_upload(settings, query_bytes, query_features.get('sha256') or '', up_name)}"
                     hits, hit_by_engine = _byte_upload_all(
                         settings, yandex, bing, google, searx,
-                        query_bytes, up_name, up_type,
+                        up_bytes, up_name, up_type,
                         image_url=local_url,
                         phase_start=phase_start,
                         # leave time for verification inside the same budget
@@ -642,6 +701,19 @@ def build_api(
                 else:
                     degraded.append("web_needs_public_url")
                     hits = []
+                # Lens-style text discovery: best guess from the reverse hits'
+                # titles -> image/icon engines -> more candidates to verify
+                if hits:
+                    text_hits, best_guess, discovery = _text_discover(hits, ai_img, phase_start)
+                    if text_hits:
+                        cap = settings.web_verify_max_candidates
+                        known_src = {h.img_src for h in hits}
+                        text_hits = [h for h in text_hits if h.img_src not in known_src]
+                        # reverse-engine hits stay first (they carry the copies);
+                        # text hits get at least a third of the verify slots
+                        n_text = min(len(text_hits), max(cap // 3, cap - len(hits)))
+                        hits = hits[: max(0, cap - n_text)] + text_hits[:n_text]
+                        providers.append("text")
                 if hits:
                     # TinEye verdict: engines only FIND candidates; the fused-hash
                     # matcher JUDGES each one (downloads it, compares hashes to the
@@ -787,6 +859,8 @@ def build_api(
             found=found,
             fallback=fallback,
             cached=web_cached,
+            best_guess=best_guess,
+            discovery=discovery,
             results=[r.to_dict() for r in results],
         )
         # reverseimagesearch / reversely grouping — feed the UI per-engine tabs
@@ -1454,6 +1528,19 @@ def _byte_upload_all(
 
     hit_by_engine = {e: bool(per_engine.get(e)) for e, _ in tasks}
     return merged, hit_by_engine
+
+
+def _sniff_format(raw: bytes | None) -> str:
+    """PIL format name of raw image bytes ("" when unknown)."""
+    if not raw:
+        return ""
+    try:
+        from PIL import Image as _Image
+
+        with _Image.open(io.BytesIO(raw)) as probe:
+            return probe.format or ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _face_crop_bytes(settings: Settings, img, faces: list[dict]) -> bytes | None:

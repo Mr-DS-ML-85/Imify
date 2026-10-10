@@ -21,7 +21,7 @@ import io
 from typing import Iterable
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 PHASH_SIZE = 8
 HASH_BITS = 64
@@ -152,6 +152,34 @@ def extract_features(img: Image.Image, raw: bytes | None = None) -> dict:
     return fs.to_dict()
 
 
+# The 7 non-identity symmetries of the square (rotations + mirrors). Phone
+# photos are re-uploaded rotated 90/180/270 and/or flipped; DCT hashes are
+# NOT invariant to that, so the query is hashed in every orientation.
+_VARIANTS: tuple[tuple[str, tuple[int, ...]], ...] = (
+    ("mirrored", (Image.Transpose.FLIP_LEFT_RIGHT,)),
+    ("rotated 90", (Image.Transpose.ROTATE_90,)),
+    ("rotated 180", (Image.Transpose.ROTATE_180,)),
+    ("rotated 270", (Image.Transpose.ROTATE_270,)),
+    ("rotated 90 + mirrored", (Image.Transpose.ROTATE_90, Image.Transpose.FLIP_LEFT_RIGHT)),
+    ("rotated 180 + mirrored", (Image.Transpose.ROTATE_180, Image.Transpose.FLIP_LEFT_RIGHT)),
+    ("rotated 270 + mirrored", (Image.Transpose.ROTATE_270, Image.Transpose.FLIP_LEFT_RIGHT)),
+)
+
+
+def hash_variants(img: Image.Image) -> list[dict]:
+    """pHash/dHash/aHash of the image under every rotation/mirror, as
+    ``[{"label", "phash", "dhash", "ahash"}]`` (identity excluded)."""
+    base = img.convert("L")
+    small = base.resize((64, 64), Image.Resampling.LANCZOS) if max(base.size) > 64 else base
+    out: list[dict] = []
+    for label, ops in _VARIANTS:
+        v = small
+        for op in ops:
+            v = v.transpose(op)
+        out.append({"label": label, "phash": p_hash(v), "dhash": d_hash(v), "ahash": a_hash(v)})
+    return out
+
+
 def decode_image(raw: bytes) -> Image.Image | None:
     """Decode image bytes safely; returns None for non-images / corrupt data.
 
@@ -171,6 +199,13 @@ def decode_image(raw: bytes) -> Image.Image | None:
                 return None
         img = Image.open(io.BytesIO(raw))
         img.load()
+        # Honor the EXIF orientation tag: phone cameras store pixels sideways
+        # and rely on the tag, while web copies are physically rotated — without
+        # this the same photo hashes as two unrelated images.
+        try:
+            img = ImageOps.exif_transpose(img)
+        except Exception:  # noqa: BLE001 — a broken EXIF block must not fail decode
+            pass
         img = img.convert("RGB") if img.mode not in ("RGB", "L", "RGBA") else img
         if img.mode == "RGBA":
             background = Image.new("RGB", img.size, (255, 255, 255))

@@ -237,10 +237,12 @@ def parse_bing_results(page: str) -> list[ImageHit]:
         )
 
     # primary: murl/purl pairs (HTML-escaped JSON)
-    for m in re.finditer(r'murl&quot;:&quot;([^&]{8,}?)&quot;(.{0,600}?)purl&quot;:&quot;([^&]{8,}?)&quot;', page):
+    # ([^&"]: a field must never run past its closing quote — pages mixing
+    # &quot; and raw JSON otherwise glue '","murl":"...' onto the page URL)
+    for m in re.finditer(r'murl&quot;:&quot;([^&"]{8,}?)&quot;(.{0,600}?)purl&quot;:&quot;([^&"]{8,}?)&quot;', page):
         add(m.group(1), m.group(3))
     # titles (t&quot;:&quot;...&quot; near the pair) — best-effort pairing
-    for m in re.finditer(r'murl&quot;:&quot;([^&]{8,}?)&quot;.{0,700}?t&quot;:&quot;([^"\\]{4,160})', page):
+    for m in re.finditer(r'murl&quot;:&quot;([^&"]{8,}?)&quot;.{0,700}?t&quot;:&quot;([^"\\&]{4,160})', page):
         murl = _decode(m.group(1))
         title = _decode(m.group(2))
         for hit in hits:

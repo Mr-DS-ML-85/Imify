@@ -44,6 +44,25 @@ similar / Unconfirmed" sections with evidence chips. Tests: 134 passing (`tests/
 `/run/media/irfan/models2/imify`); StrikeDB :6008 and proxify :8081/:8888 were NOT running; SearXNG up.
 Not touched — needs the user's go-ahead (fix the unit's paths to `/run/media/irfan/models/imify`).
 
+**2026-10-10 (part 2) — engines, rotation, bandwidth, stack:**
+- Stack started from `reference/`: `scripts/start_strikedb.sh` (CPU-only `DBSTRIKE_GPU=cpu`; `data/lib/libnvrtc.so.12`
+  symlink → pinokio miniforge, needed only to LINK) and `scripts/start_proxify.sh [--recreate]` (existing image
+  `proxy-orchestrator-orchestrator:latest`, 127.0.0.1:8081/8888, GUI profile in volume `proxify-gui-profile`, cookies =
+  `scripts/filter_cookies.py` allowlist of search/FB domains → `data/proxify-cookies.txt`; NEVER mount the full
+  gui-cookies.txt — it holds LastPass/Proton/ChatGPT sessions and is committed in git history!).
+- **Text-guided discovery** `app/engines/text_images.py`: best guess from reverse-hit titles/URL slugs → SearXNG
+  engines in 4-engine chunks with `timeout_limit` (icons only for logo-like queries) → blocked engines retried in
+  proxify gui_chrome (Bing parser + generic). Live: Elon photo → 4 face-verified other photos via pinterest/findthatmeme.
+  Blocked live: google images (captcha even in browser), qwant, brave, duckduckgo. Not in this SearXNG: startpage,
+  mojeek, deviantart, library of congress.
+- Rotation: EXIF transpose in decode + 8 orientation hash variants (≤0.20 fused for non-identity).
+- Bandwidth: thumbnail triage before full download, per-URL byte cache `vc:` (7d), preview dir capped.
+- Cookies: exporter wrote Chromium 1601-epoch seconds (+369y) → nothing ever expired. Fixed in
+  `reference/proxify/.../brave_cookies.py` and normalized on read; `/v1/stats.cookies` shows live/expired/soonest.
+- Pre-existing bugs fixed: Bing parser glued `","murl":"…` onto page URLs; WebP uploads gave Bing off-topic results
+  (now re-encoded to JPEG for engines); SearXNG reverse fallback text-searched "reverse image search" (junk
+  candidates) — removed; engine label duplication on merge.
+
 ---
 
 ## 1. WHAT THIS PRODUCT IS

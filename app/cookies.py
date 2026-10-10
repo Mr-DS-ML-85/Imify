@@ -22,6 +22,19 @@ import time
 from pathlib import Path
 
 
+# Seconds between 1601-01-01 (Chromium's epoch) and 1970-01-01.
+_WINDOWS_EPOCH_OFFSET = 11_644_473_600
+
+
+def normalize_expiry(exp: int) -> int:
+    """Unix expiry seconds. Some exporters write Chromium's 1601-based
+    seconds as-is, pushing every expiry ~369 years into the future so dead
+    sessions never look expired; shift those back."""
+    if exp > time.time() + 100 * 365 * 86400:
+        return exp - _WINDOWS_EPOCH_OFFSET
+    return exp
+
+
 class CookieFile:
     """Lazily-loaded Netscape cookie file with per-host header export.
 
@@ -62,7 +75,7 @@ class CookieFile:
                         continue
                     domain, include_sub, _, _secure, expires, name, value = parts[:7]
                     try:
-                        if int(expires) < time.time():
+                        if normalize_expiry(int(expires)) < time.time():
                             continue  # expired — never send
                     except ValueError:
                         pass
@@ -120,3 +133,50 @@ def build_cookie_header(cookie_path: str | Path | None, host: str) -> str:
     if not cookie_path:
         return ""
     return CookieFile(cookie_path).header_for(host)
+
+
+def cookie_health(path: str | Path | None, domains: tuple[str, ...] = ("facebook.com", "google.com", "yandex.com", "bing.com")) -> dict:
+    """Freshness report for the session-cookie file (never exposes values).
+
+    Session cookies expire (Facebook's ``xs``/``c_user`` typically within
+    days), after which the FB/Google resolution chain silently degrades to
+    login stubs. Surfacing per-domain counts + the soonest expiry lets the
+    admin re-export cookies BEFORE searches start failing.
+    """
+    if not path:
+        return {"configured": False}
+    p = Path(path)
+    if not p.is_file():
+        return {"configured": True, "exists": False}
+    now = time.time()
+    report: dict[str, dict] = {d: {"live": 0, "expired": 0, "soonest_expiry_h": None} for d in domains}
+    try:
+        lines = p.read_text(errors="ignore").splitlines()
+    except OSError:
+        return {"configured": True, "exists": True, "readable": False}
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        host = parts[0].replace("#HttpOnly_", "").lstrip(".").lower()
+        for d in domains:
+            if host == d or host.endswith("." + d):
+                try:
+                    exp = normalize_expiry(int(parts[4] or 0))
+                except ValueError:
+                    exp = 0
+                entry = report[d]
+                if exp and exp < now:
+                    entry["expired"] += 1
+                else:
+                    entry["live"] += 1
+                    if exp:
+                        hours = round((exp - now) / 3600, 1)
+                        if entry["soonest_expiry_h"] is None or hours < entry["soonest_expiry_h"]:
+                            entry["soonest_expiry_h"] = hours
+    return {
+        "configured": True,
+        "exists": True,
+        "file_age_h": round((now - p.stat().st_mtime) / 3600, 1),
+        "domains": report,
+    }

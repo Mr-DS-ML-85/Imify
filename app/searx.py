@@ -110,19 +110,13 @@ class SearxClient:
     def reverse_search(self, image_url: str, safesearch: int = 0) -> list[ImageHit]:
         """Live web reverse image search for a publicly reachable image URL.
 
-        Some SearXNG builds reject an empty ``q`` (400 Bad Request) even when
-        ``image_url`` is set — retry once with the URL's host as the query so
-        the engines that DO answer ``image_url`` still get the request.
+        Only engines that honor ``image_url`` answer. When SearXNG rejects
+        the request (some builds refuse an empty ``q``) this DEGRADES — it
+        must never fall back to a text query: the old fallback searched the
+        literal words "reverse image search" and fed pages ABOUT reverse
+        image search tools into every result set as candidates.
         """
-        try:
-            data = self._get_json(
-                {"q": "", "image_url": image_url, "categories": "images", "safesearch": safesearch}
-            )
-        except SearxError:
-            # fallback: non-empty q keeps the request valid
-            data = self._get_json(
-                {"q": "reverse image search", "image_url": image_url, "categories": "images", "safesearch": safesearch}
-            )
+        data = self._get_json({"q": "", "image_url": image_url, "categories": "images", "safesearch": safesearch})
         return self._parse_results(data)
 
     def discover(self, query: str, safesearch: int = 0) -> list[ImageHit]:

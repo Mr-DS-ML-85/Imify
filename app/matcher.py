@@ -36,6 +36,23 @@ from app.features import encode_hash_vector, hamming
 _WEB_PREVIEW_SUBDIR = "web-preview"
 
 
+_preview_writes = 0
+
+
+def _prune_previews(d: Path, max_files: int) -> None:
+    """Keep the preview cache bounded: drop the oldest files past the cap."""
+    try:
+        files = sorted(d.iterdir(), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    excess = len(files) - max_files
+    for p in files[: max(0, excess)]:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+
+
 def _cache_web_preview(content: bytes, settings: Settings) -> str | None:
     """Persist a verified web candidate's pixels locally so the UI loads them
     from our static mount instead of the raw (often hotlink-protected /
@@ -47,6 +64,10 @@ def _cache_web_preview(content: bytes, settings: Settings) -> str | None:
         p = d / name
         if not p.exists():
             p.write_bytes(content)
+            global _preview_writes
+            _preview_writes += 1
+            if _preview_writes % 500 == 0:
+                _prune_previews(d, settings.web_preview_max_files)
         return f"/uploads/{_WEB_PREVIEW_SUBDIR}/{name}"
     except Exception:  # noqa: BLE001 — preview caching is best-effort
         return ""
@@ -109,8 +130,6 @@ class Matcher:
                     continue
                 r.clip_sim = round(sim, 4)
                 r.ai_modalities = sorted(set(r.ai_modalities or []) | {"hash", "clip"})
-            else:
-                r.ai_modalities = sorted(set(r.ai_modalities or []) | {"hash"})
             kept.append(r)
         return kept
 
@@ -191,9 +210,15 @@ class Matcher:
         return out
 
     def _ann_search(self, query_features: dict, mode: str, limit: int) -> list[SearchResult]:
-        phash = int(query_features.get("phash", 0))
-        query_vec = encode_hash_vector(phash)
-        hits = self.repo.db.vsearch(self.settings.vsearch_k, query_vec)
+        phashes = [int(query_features.get("phash", 0))]
+        phashes += [int(v["phash"]) for v in query_features.get("variants") or ()]
+        hits: list[tuple[int, float]] = []
+        seen: set[int] = set()
+        for phash in phashes:  # rotated/mirrored copies live elsewhere in Hamming space
+            for hid, dist in self.repo.db.vsearch(self.settings.vsearch_k, encode_hash_vector(phash)):
+                if hid not in seen:
+                    seen.add(hid)
+                    hits.append((hid, dist))
         results = self._rerank_hits(hits, query_features, mode)
         return results[:limit]
 
@@ -203,11 +228,11 @@ class Matcher:
             return []
         metas = [m for m in self.repo.get_images(ids) if m is not None]
         scored: list[tuple[float, ImageMeta]] = []
-        fused_map: dict[int, tuple[float, int, int, int]] = {}
+        fused_map: dict[int, tuple[float, int, int, int, str]] = {}
         for meta in metas:
-            fused, dp, dd, da = self._fused_distance(query_features, meta)
+            fused, dp, dd, da, label = self._best_fused(query_features, meta.phash, meta.dhash, meta.ahash, self.settings.rotation_variant_max_fused)
             scored.append((fused, meta))
-            fused_map[meta.id] = (fused, dp, dd, da)
+            fused_map[meta.id] = (fused, dp, dd, da, label)
         scored.sort(key=lambda t: t[0])
         hits = [(meta.id, 0.0) for _, meta in scored[: self.settings.vsearch_k]]
         results = self._rerank_hits(hits, query_features, mode, exact_fused=fused_map)
@@ -218,7 +243,7 @@ class Matcher:
         hits: list[tuple[int, float]],
         query_features: dict,
         mode: str,
-        exact_fused: dict[int, tuple[float, int, int, int]] | None = None,
+        exact_fused: dict[int, tuple[float, int, int, int, str]] | None = None,
     ) -> list[SearchResult]:
         ids = [hid for hid, _ in hits]
         metas = self.repo.get_images(ids)
@@ -229,9 +254,9 @@ class Matcher:
             if meta is None:
                 continue
             if exact_fused is not None and image_id in exact_fused:
-                fused, dp, dd, da = exact_fused[image_id]
+                fused, dp, dd, da, label = exact_fused[image_id]
             else:
-                fused, dp, dd, da = self._fused_distance(query_features, meta)
+                fused, dp, dd, da, label = self._best_fused(query_features, meta.phash, meta.dhash, meta.ahash, self.settings.rotation_variant_max_fused)
             if mode in ("best", "exact", "biggest", "newest") and fused > fused_near:
                 continue  # only strong near-duplicates for these modes
             if mode == "changed" and not (fused_exact < fused <= 0.5):
@@ -261,6 +286,8 @@ class Matcher:
                     source_urls=list(meta.source_urls or []),
                     caption=meta.caption or "",
                     clip_embedding=list(meta.clip_embedding or []),
+                    ai_modalities=["hash"] + ([label.split(" ")[0]] if label else []),
+                    note=label,
                 )
             )
         # post-rerank: boost exact matches, bigger images, fresher results
@@ -330,6 +357,25 @@ class Matcher:
         else:
             fused = dp / 64.0
         return round(fused, 4), dp, dd, da
+
+    @staticmethod
+    def _best_fused(
+        query_features: dict, phash: int, dhash: int, ahash: int, variant_max: float = 0.20
+    ) -> tuple[float, int, int, int, str]:
+        """Fused distance against the query in its best orientation
+        (identity + the rotation/mirror ``variants`` when present). Returns
+        (fused, phash_hamming, dhash_hamming, ahash_hamming, variant_label).
+
+        A rotated/mirrored orientation only counts when it is a tight match
+        (<= ``variant_max``): a real rotated copy scores ~0, while trying 8
+        orientations gives low-detail images 8x the chances to collide."""
+        fused, dp, dd, da = Matcher._fused_from_hashes(query_features, phash, dhash, ahash)
+        label = ""
+        for v in query_features.get("variants") or ():
+            vf, vp, vd, va = Matcher._fused_from_hashes(v, phash, dhash, ahash)
+            if vf < fused and vf <= variant_max:
+                fused, dp, dd, da, label = vf, vp, vd, va, v.get("label", "rotated")
+        return fused, dp, dd, da, label
 
     @staticmethod
     def _sort_mode(results: list[SearchResult], mode: str) -> list[SearchResult]:
@@ -427,6 +473,7 @@ class Matcher:
         cookie_file = CookieFile(self.settings.cookie_file) if self.settings.cookie_file else None
         proxify_fetch = self.settings.proxify_fetch_url.rstrip("/") if self.settings.proxify_fetch_url else ""
 
+        fb_enabled = self.settings.facebook_resolution_enabled
         render_budget = self.settings.web_verify_render_max
         renders_used = 0
 
@@ -536,7 +583,7 @@ class Matcher:
                 # FB CDN signatures expire in minutes -> "Bad URL hash" 403s.
                 # If the engine ALSO gave us the page (photo.php), walk it to
                 # mint a fresh signed URL instead of declaring the candidate dead.
-                if "fbcdn" in host and referer and referer != url:
+                if "fbcdn" in host and referer and referer != url and fb_enabled:
                     ref_host = (urlparse(referer).hostname or "").lower()
                     if "facebook.com" in ref_host or "fbsbx.com" in ref_host:
                         return fetch_bytes(
@@ -559,7 +606,7 @@ class Matcher:
                 # Facebook lookaside stubs: <script>location.href = "..."</script>
                 # (the href is JSON-escaped: https:\/\/www.facebook.com\/photo.php...)
                 m = re.search(r'location\.href\s*=\s*["\']([^"\']+)["\']', text)
-                if m:
+                if m and fb_enabled:
                     target = m.group(1).replace("\\/", "/")
                     return fetch_bytes(
                         target,
@@ -573,8 +620,9 @@ class Matcher:
                 if m:
                     return fetch_bytes(m.group(1), referer=url, depth=depth + 1, hops=hops + ["og:image"])
                 # Facebook comet photo pages: JS shell — render via proxify browser.
-                if "facebook.com" in host or "fbsbx.com" in host:
+                if ("facebook.com" in host or "fbsbx.com" in host) and fb_enabled:
                     content, fresh_url = render_photo_page(url, depth)
+                    self.repo.record_provider("facebook-render", ok=bool(content))
                     if content:
                         return content, fresh_url or url, hops + ["render:gui_chrome"]
                     return None, url, hops + ["render-failed"]
@@ -582,28 +630,96 @@ class Matcher:
 
         # ---- query-side profile, computed once for every candidate --------
         from app import geometry
-        from app.features import extract_features as _xf
-        from PIL import ImageOps
 
         clip = self.clip if (self.clip is not None and self.clip.available) else None
         face = self.face if (self.face is not None and self.face.available and query_faces) else None
-        flip_features: dict | None = None
         q_kp = q_kp_mirror = None
         if query_img is not None:
-            try:
-                flip_features = _xf(ImageOps.mirror(query_img))
-            except Exception:  # noqa: BLE001
-                flip_features = None
+            if not query_features.get("variants"):
+                from app.features import hash_variants
+
+                query_features = {**query_features, "variants": hash_variants(query_img)}
             if self.settings.geometric_verify_enabled:
                 q_kp = geometry.Keypoints.from_image(query_img)
                 q_kp_mirror = geometry.Keypoints.from_image(geometry.mirror(query_img))
         st = self.settings
         clip_floor = st.clip_verify_min_sim
 
+        cache_ttl = st.web_candidate_cache_ttl_seconds
+        preview_dir = Path(st.uploads_dir) / _WEB_PREVIEW_SUBDIR
+
+        def cached_fetch(url: str, referer: str | None) -> tuple[bytes | None, str, list[str]]:
+            """fetch_bytes behind a per-URL byte cache: a candidate seen in
+            the last ``web_candidate_cache_ttl_seconds`` is read from disk,
+            never downloaded again (bandwidth guard)."""
+            key = "vc:" + hashlib.sha1(url.encode()).hexdigest()
+            if cache_ttl > 0:
+                try:
+                    entry = self.repo.db.get_json(key)
+                except Exception:  # noqa: BLE001
+                    entry = None
+                if entry and time.time() - float(entry.get("ts", 0)) < cache_ttl:
+                    path = preview_dir / str(entry.get("file", ""))
+                    if path.is_file():
+                        return path.read_bytes(), entry.get("resolved") or url, list(entry.get("hops") or []) + ["cache"]
+            content, resolved, hops = fetch_bytes(url, referer=referer)
+            if content and cache_ttl > 0:
+                local = _cache_web_preview(content, self.settings)
+                if local:
+                    try:
+                        self.repo.db.set_json(key, {
+                            "ts": time.time(), "file": local.rsplit("/", 1)[-1],
+                            "resolved": resolved, "hops": hops,
+                        })
+                    except Exception:  # noqa: BLE001 — cache is best-effort
+                        pass
+            return content, resolved, hops
+
+        def triage(hit: ImageHit) -> SearchResult | None:
+            """Judge the engine THUMBNAIL first; return an unverified result
+            when it is clearly unrelated (full image never downloaded), or
+            None to proceed with the full verification."""
+            thumb_url = (getattr(hit, "thumbnail_src", "") or "").strip()
+            if not st.web_verify_thumbnail_triage or not thumb_url or thumb_url == hit.img_src:
+                return None
+            if not thumb_url.startswith(("http://", "https://")):
+                return None
+            tb, _r, thops = cached_fetch(thumb_url, referer=hit.url or None)
+            timg = decode_image(tb) if tb else None
+            if timg is None:
+                return None  # thumbnail unusable -> decide on the full image
+            tf = extract_features(timg)
+            tfused, tdp, _, _, _ = self._best_fused(
+                query_features, int(tf["phash"]), int(tf["dhash"]), int(tf["ahash"]), st.rotation_variant_max_fused
+            )
+            if tfused <= fused_near + 0.08:
+                return None  # could be a copy
+            tclip = clip.match(query_clip, clip.embed_image(timg)) if (clip and query_clip) else None
+            if tclip is None:
+                return None  # no semantic signal -> can't safely reject
+            if tclip >= min(st.geometric_clip_prefilter, st.clip_similar_min_sim):
+                return None  # could be a crop / similar content
+            if face is not None:
+                big = timg.resize((timg.width * 2, timg.height * 2)) if max(timg.size) < 400 else timg
+                if face.detect_faces(big):
+                    return None  # a person — maybe the same one
+            return self._unverified(
+                hit,
+                hamming=tdp,
+                fused=tfused,
+                note=f"rejected on thumbnail (hash Δ{tdp}, clip {tclip:.2f}) — full image not downloaded",
+                resolution=thops + ["thumbnail-triage"],
+                thumb=_cache_web_preview(tb, self.settings) or "",
+                clip_sim=tclip,
+            )
+
         def verify_one(hit: ImageHit) -> SearchResult:
             hops: list[str] = []
             try:
-                content, resolved_url, hops = fetch_bytes(hit.img_src, referer=hit.url or hit.img_src)
+                early = triage(hit)
+                if early is not None:
+                    return early
+                content, resolved_url, hops = cached_fetch(hit.img_src, referer=hit.url or hit.img_src)
                 if not content:
                     return self._unverified(hit, note="; ".join(hops) or "unreachable", resolution=hops)
                 img = decode_image(content)
@@ -613,12 +729,8 @@ class Matcher:
                     return self._unverified(hit, note=f"too small ({img.size[0]}x{img.size[1]})", resolution=hops)
                 feats = extract_features(img, content)
                 cand_hashes = (int(feats["phash"]), int(feats["dhash"]), int(feats["ahash"]))
-                fused, dp, _, _ = self._fused_from_hashes(query_features, *cand_hashes)
-                mirrored = False
-                if flip_features is not None:
-                    ffused, fdp, _, _ = self._fused_from_hashes(flip_features, *cand_hashes)
-                    if ffused < fused:
-                        fused, dp, mirrored = ffused, fdp, True
+                fused, dp, _, _, orient = self._best_fused(query_features, *cand_hashes, self.settings.rotation_variant_max_fused)
+                mirrored = bool(orient)
                 # CLIP: semantic closeness. Gates hash matches (two different
                 # logos can hash close), prefilters geometry, and powers the
                 # "visually similar" section. The candidate embedding also
@@ -700,8 +812,9 @@ class Matcher:
                 if clip_sim is not None and "clip" not in modalities and mtype:
                     modalities.append("clip")
                 if mirrored and mtype in ("exact", "near", "modified"):
-                    modalities.append("mirrored")
-                    note = (note + "; " if note else "") + "mirrored"
+                    orient = orient or "mirrored"
+                    modalities.append(orient.split(" ")[0])
+                    note = (note + "; " if note else "") + orient
             except Exception:  # noqa: BLE001 — a bad candidate must never fail the search
                 return self._unverified(hit, note="verification error", resolution=hops)
 
@@ -1039,8 +1152,9 @@ def _merge_duplicate(group: SearchResult, r: SearchResult) -> None:
         group.image_id = r.image_id or group.image_id
         group.confidence = max(group.confidence, r.confidence)
     group.ai_modalities = sorted(set(group.ai_modalities or []) | set(r.ai_modalities or []))
-    engines = {group.engine, r.engine}
-    engines.discard("")
+    # engine labels are comma-joined sets — split before merging so repeated
+    # merges don't grow "yandex,yandex,yandex"
+    engines = {e for e in f"{group.engine},{r.engine}".split(",") if e}
     group.engine = ",".join(sorted(engines)) or group.engine
     src_set = set(group.source_urls or []) | set(r.source_urls or [])
     # The ORIGINAL WEBSITE (page_url) is the primary "found on" link — CDN

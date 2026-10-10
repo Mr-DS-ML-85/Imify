@@ -225,6 +225,22 @@ class Settings(BaseSettings):
     # Live reverse providers, in order: "searxng" and/or "bing" and/or
     # "yandex" and/or "google".
     reverse_providers: str = "searxng,bing,yandex,google"
+    # --- Text-guided discovery (Google-Lens "best guess") ---
+    # After the reverse engines answer, their result titles yield a "best
+    # guess" query ("python logo"); it is searched on SearXNG's image/icon
+    # engines (blocked ones retried in proxify's real browser) and every
+    # candidate goes through the same verifier. Finds copies no reverse
+    # index has seen.
+    text_discovery_enabled: bool = True
+    # Comma-separated SearXNG engine names; empty = all web + general image
+    # engines from app/engines/text_images.py (icon engines are added
+    # automatically for logo/icon-like queries — see text_discovery_icons).
+    text_discovery_engines: str = ""
+    # "auto" (logo/icon-like queries only) | "always" | "never"
+    text_discovery_icons: str = "auto"
+    text_discovery_budget_seconds: float = 6.0
+    # Max blocked engines retried through proxify's browser per search.
+    text_discovery_browser_max: int = 2
 
     # --- On-the-fly matching / storage bounds ---
     # By default searches return hash-verified web matches WITHOUT persisting
@@ -264,6 +280,11 @@ class Settings(BaseSettings):
     # (Google limits face results; our own matcher does not).
     fused_exact_threshold: float = 0.14
     fused_near_threshold: float = 0.35
+    # Rotated / mirrored copies (phone photos turned 90°, flipped re-uploads)
+    # are matched by hashing the query in all 8 orientations. A real rotated
+    # copy scores ~0; a non-identity orientation must be at least this tight
+    # (trying 8 orientations multiplies chance collisions on flat images).
+    rotation_variant_max_fused: float = 0.20
     exact_scan_max_images: int = 200_000
     vsearch_k: int = 128
     default_num_results: int = 40
@@ -303,6 +324,23 @@ class Settings(BaseSettings):
     # ~10s through the single shared Chrome — capping keeps a FB-heavy result
     # set from stalling the whole search.
     web_verify_render_max: int = 4
+    # --- Bandwidth guards (verification downloads) ---
+    # Triage every candidate on the engine's THUMBNAIL (~10 KB) first and
+    # download the full image only when the thumbnail is promising (hash
+    # close, CLIP close, or a face when the query has one). Most engine junk
+    # is rejected without ever fetching the full-size file.
+    web_verify_thumbnail_triage: bool = True
+    # Downloaded candidate bytes are cached per URL (on disk, under
+    # uploads/web-preview) so the same candidate is never fetched twice
+    # within this window — repeat searches and the tracker reuse it.
+    web_candidate_cache_ttl_seconds: int = 7 * 86400
+    # Cap on cached candidate previews (oldest pruned first).
+    web_preview_max_files: int = 20000
+    # Facebook photo pages need a cookie + browser-render chain that breaks
+    # whenever FB changes its markup or the session cookies expire, and FB's
+    # ToS forbids scraping. Off = FB candidates are only used when a plain
+    # fetch already returns the image.
+    facebook_resolution_enabled: bool = True
 
     # --- Persistent tracking / auto-update ("search the whole internet in bg") --
     # When a search uploads a new image it is indexed AND a background tracker

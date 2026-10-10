@@ -141,6 +141,7 @@ def settings(tmp_path):
         auth_mode="open",
         rate_limit_per_minute=1000,
         cookie_file="",
+        text_discovery_enabled=False,
     )
 
 

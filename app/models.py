@@ -220,6 +220,11 @@ class SearchResponse:
     # True when the query was answered by description (AI text search) instead
     # of by pixels.
     text_query: bool = False
+    # Google-Lens style "best guess" derived from what other sites call this
+    # image, and the text-discovery fan-out it drove ({queries, engines,
+    # blocked, browser_used}).
+    best_guess: str = ""
+    discovery: dict[str, Any] = field(default_factory=dict)
     results: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
