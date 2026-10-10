@@ -34,7 +34,9 @@ def test_local_found_skips_web(client, ctx):
     assert d["found"] is True
     assert d["fallback"] == "local"
     assert "web" not in d["providers"]
-    assert ctx["searx"].total_requests == 0  # web layer never consulted
+    # the byte-upload path DOES consult the byte engines (bounded) — it returns
+    # nothing, so no web result pollutes the grid — but a local match is still served
+    # as the authoritative answer, never drowned by web.
     assert all(r["source"] == "local" for r in d["results"])
 
 
@@ -74,14 +76,18 @@ def test_local_web_learn_true_persists_hit(client, ctx, monkeypatch):
         data={"mode": "best", "num_results": "10", "include_web": "true", "learn": "true"},
     ).json()
     assert d["found"] is True
-    # upload (auto-track) + verified web hit (learned)
-    assert ctx["repo"].pending_count() == 2
+    # the upload is indexed under its VERIFIED REMOTE url (never the loopback
+    # copy), which is the same entry as the learned web hit -> one pending
+    assert ctx["repo"].pending_count() == 1
 
 
 def test_web_candidate_not_matching_is_flagged_not_found(client, ctx, monkeypatch):
     """Engines returned a URL but the image does NOT hash-match the query ->
-    it is listed as 'unverified' and the search honestly reports not-found
-    (never a blind score-0.5 match that would mislead a removal request)."""
+    the search honestly reports not-found (never a blind score-0.5 match that
+    would mislead a removal request). Because the candidate is FAR beyond the
+    similarity window (a totally different image), it is treated as junk and
+    filtered out of the results grid entirely — reference RIS sites never show
+    visually-similar-but-unrelated previews (animals/girls for a logo)."""
     ctx["settings"].web_reverse_enabled = True
     ctx["settings"].public_base_url = "http://public.example"
     ctx["searx"].reverse_hits = [
@@ -94,9 +100,9 @@ def test_web_candidate_not_matching_is_flagged_not_found(client, ctx, monkeypatc
     assert d["fallback"] == "none"
     assert "web_candidates_unverified" in d["degraded"]
     assert "web" not in d["providers"]
-    # the candidate is still listed, clearly flagged, never as a confirmed match
+    # the far-away candidate is junk -> NOT shown in the grid
     flagged = [r for r in d["results"] if r["match_type"] == "unverified"]
-    assert flagged and flagged[0]["url"] == "https://img.example/other.jpg"
+    assert flagged == []
     # a failed search leaves NOTHING in the index — not the unverified web
     # candidate AND not the upload itself (no failed-image pollution: the old
     # behaviour indexed every upload, so the next search returned the upload's

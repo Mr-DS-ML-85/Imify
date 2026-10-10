@@ -60,6 +60,18 @@ Facebook candidates are resolved through a three-hop chain — lookaside stub �
 photo.php with your real session cookies → proxify gui_chrome render to reveal
 the signed scontent image URL — before being hashed and judged.
 
+**"Found on N sites" consolidation.** Same photo returned by several engines
+and sites (re-encoded/downloaded copies) is consolidated into **one card**
+whose `source_urls` / `source_count` carry every site — TinEye's "found on N
+sites" removal list — instead of flooding the grid with near-identical tiles.
+
+**Optional self-hosted AI + OCR.** Point `AI_OLLAMA_URL` at a local Ollama and
+Imify auto-captions indexed images (vision model) and answers natural-language
+searches (`/v1/search/text`) by embedding similarity. Enable `OCR_ENABLED` and
+imaged visible text is extracted (tesseract) and searchable (`/v1/search/ocr`)
+— perfect for logos, memes and screenshots. Both are opt-in and degrade
+cleanly: with them off, the pure perceptual pipeline runs exactly as before.
+
 **SearchOS ideas ported:** search state as a durable asset (every query, pending
 URL and image lives in KV and resumes across restarts) · discovery → fetch →
 process worker pipeline · coverage map per seed query with re-crawl freshness ·
@@ -112,6 +124,8 @@ STORAGE_BACKEND=sqlite uv run uvicorn app.main:app --port 8000
 | Endpoint | Auth | Description |
 |---|---|---|
 | `POST /v1/search` | key\* | Reverse search. `multipart` `file`, or `image_url`, or `image_id`. Query params: `mode` (`best\|color\|biggest\|newest\|changed\|exact`), `num_results`, `include_web`. |
+| `POST /v1/search/text` | key\* | Natural-language search over AI captions (needs Ollama). |
+| `POST /v1/search/ocr` | key\* | Keyword search over OCR text in indexed images (needs tesseract). |
 | `GET /v1/image/{id}` | – | Indexed image metadata. |
 | `GET /v1/history` | – | Recent searches. |
 | `GET /v1/stats` | – | Index statistics. |
@@ -158,9 +172,15 @@ All env-driven (see `.env.example`). Key knobs:
 | `CRAWLER_INTERVAL_SECONDS` | `3600` | seed re-run / freshness |
 | `CRAWLER_RECRAWL_AFTER_SECONDS` | `604800` | re-fetch stale images (7 days) |
 | `HAMMING_EXACT/NEAR_THRESHOLD` | `4` / `16` | single-hash match bands |
-| `FUSED_EXACT_THRESHOLD` / `FUSED_NEAR_THRESHOLD` | `0.08` / `0.22` | fused pHash+dHash+aHash match bands (the verdict) |
+| `FUSED_EXACT_THRESHOLD` / `FUSED_NEAR_THRESHOLD` | `0.14` / `0.35` | fused pHash+dHash+aHash match bands (the verdict) |
+| `SEARCH_DEDUP_THRESHOLD` | `8` | Hamming bits for consolidating same-photo results into one "found on N sites" card (0 disables) |
 | `WEB_VERIFY_CANDIDATES` | `true` | download + hash-verify web candidates before reporting |
-| `WEB_VERIFY_CONCURRENCY` / `WEB_VERIFY_MAX_CANDIDATES` | `6` / `24` | candidate fetch limits |
+| `WEB_VERIFY_CONCURRENCY` / `WEB_VERIFY_MAX_CANDIDATES` | `10` / `80` | candidate fetch limits |
+| `WEB_UNVERIFIED_MAX_FUSED` / `WEB_ENGINE_BING_PENALTY` | `0.36` / `1.35` | junk-preview filter + Bing de-rank |
+| `AI_OLLAMA_URL` | – | local Ollama endpoint; enables auto-captioning + `/v1/search/text` |
+| `AI_CAPTION_MODEL` / `AI_EMBED_MODEL` | `llama3.2-vision` / `nomic-embed-text` | Ollama models |
+| `AI_CAPTION_ON_INDEX` | `false` | caption every indexed image (alt-text + text search) |
+| `OCR_ENABLED` / `OCR_LANG` | `false` / `eng` | extract visible text from indexed images (`/v1/search/ocr`) |
 | `TRACKER_VERIFY_CANDIDATES` | `true` | tracker candidates are hash-verified before ingestion |
 | `EXACT_SCAN_MAX_IMAGES` | `200000` | brute-force scan below this, ANN above |
 | `AUTH_MODE` | `open` | `open` or `key` |
@@ -231,6 +251,8 @@ app/
   matcher.py     Hamming ANN search + exact scan + color + fusion/rerank
   indexer.py     discovery/fetch/process pipeline + tracker loop
   searx.py       SearXNG client (JSON API, throttled)
+  ai.py          optional self-hosted AI (Ollama captions + embeddings)
+  ocr.py         optional OCR text extraction (tesseract)
   engines/       live reverse providers (searxng, google-via-proxify) + chain
   repo.py        domain repository over the storage protocol
   storage/       protocol + StrikeDB (RESP) + SQLite backends

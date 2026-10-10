@@ -171,8 +171,22 @@ class Repository:
         meta.source_urls.append(url)
         meta.source_count = len(meta.source_urls)
         meta.last_seen = time.time()
-        if page_url and not meta.page_url:
-            meta.page_url = page_url
+
+        def _is_remote(u: str) -> bool:
+            low = (u or "").lower()
+            if not (low.startswith("http://") or low.startswith("https://")):
+                return False
+            host = (u.split("://", 1)[1].split("/", 1)[0] or "").lower()
+            return host not in {"127.0.0.1", "localhost"} and not host.startswith(("127.", "10.", "192.168."))
+
+        # Prefer a real remote source as the canonical link/page over a stale
+        # local (file:// / 127.0.0.1 loopback) entry, so the index surfaces the
+        # site hosting the image — not our own disk copy.
+        if _is_remote(url) and not _is_remote(meta.url):
+            meta.url = url
+        if page_url and page_url != meta.page_url:
+            if _is_remote(page_url) or not meta.page_url:
+                meta.page_url = page_url
         if title and not meta.title:
             meta.title = title
         self.update_image(meta)
@@ -435,7 +449,7 @@ class Repository:
     # from memory instead of re-hitting SearXNG/Bing/Google/Yandex. Verified
     # matches only — unverified candidates are never cached (they are not "where
     # this image lives"). TTL keeps the cache from going stale forever.
-    WEB_CACHE = "wb:"
+    WEB_CACHE = "wb2:"
 
     def get_web_results(self, sha256: str, ttl_seconds: int) -> list[dict] | None:
         if not sha256:

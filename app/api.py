@@ -38,22 +38,29 @@ from __future__ import annotations
 import time
 from pathlib import Path
 from typing import Annotated, Optional
+import io
+import math
 
 import httpx
+import numpy as np
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
 
 from app.auth import AuthService, RateLimiter
+from app.ai import AiClient
+from app.clip import Clipper
+from app.enhance import Enhancer
 from app.config import Settings
 from app.engines import run_reverse_chain
 from app.engines.bing_images import BingImagesReverse
 from app.engines.google_images import GoogleImagesReverse
 from app.engines.yandex_images import YandexImagesReverse
 from app.features import decode_image, extract_features
-from app.indexer import Indexer
+from app.face import FaceId
+from app.indexer import Indexer, local_pixels
 from app.logging import child_logger
-from app.matcher import Matcher, fuse_results
-from app.models import ImageHit, SearchResponse, SearchResult
+from app.matcher import Matcher, consolidate_duplicates, fuse_results
+from app.models import COPY_MATCH_TYPES, MATCH_FAMILY_RANK, ImageHit, ImageMeta, SearchResponse, SearchResult
 from app.repo import Repository
 from app.resolve import resolve_image_bytes
 from app.searx import SearxClient, DEFAULT_UA
@@ -71,8 +78,149 @@ def build_api(
     google: GoogleImagesReverse | None = None,
     bing: BingImagesReverse | None = None,
     yandex: YandexImagesReverse | None = None,
+    ai: AiClient | None = None,
+    face: FaceId | None = None,
+    clip: Clipper | None = None,
+    enhancer: Enhancer | None = None,
 ) -> APIRouter:
     router = APIRouter()
+    ai = ai or AiClient(
+        url=settings.ai_base_url or settings.ai_ollama_url,
+        caption_model=settings.ai_caption_model,
+        embed_model=settings.ai_embed_model,
+        api_key=settings.ai_api_key,
+        timeout_seconds=settings.ai_caption_timeout_seconds,
+        caption_url=settings.ai_caption_url,
+    )
+    face = face or FaceId.from_settings(settings)
+    clip = clip or Clipper.from_settings(settings)
+    enhancer = enhancer or Enhancer(
+        enabled=settings.enhancer_enabled,
+        models_dir=str(settings.enhance_models_dir),
+        blur_limit=settings.enhance_blur_limit,
+    )
+
+    # one shared model instance per layer (matcher verifies web candidates
+    # with the same face/CLIP models the API and indexer use)
+    if getattr(matcher, "clip", None) is None:
+        matcher.clip = clip
+    if getattr(matcher, "face", None) is None:
+        matcher.face = face
+
+    def _local_ai_grid(
+        query_img,
+        known: set[int],
+        query_faces: list[list[float]] | None,
+        query_clip: list[float] | None,
+        limit: int = 12,
+    ) -> list[SearchResult]:
+        """Merge THIS search's own-AI matches (same face / similar content /
+        same visible text) from the LOCAL index into the main grid.
+
+        Excludes image_ids already served as hash copies (``known``). Pure
+        local, no web calls, so it never adds latency to the web ladder.
+        """
+        from app.ocr import OcrExtractor as _OE
+        out: list[SearchResult] = []
+        seen: set[int] = set(known)
+        images = [m for m in repo.all_images() if m.id not in seen]
+        by_id = {m.id: m for m in images}
+
+        def _wrap(meta: ImageMeta, score: float, cat: str, mtype: str, **extra) -> SearchResult:
+            return SearchResult(
+                image_id=meta.id,
+                url=meta.url,
+                page_url=meta.page_url,
+                title=meta.title or meta.url,
+                engine=meta.engine,
+                source="local",
+                score=round(float(score), 4),
+                match_type=mtype,
+                category=cat,
+                width=meta.width,
+                height=meta.height,
+                thumb=f"/img/{meta.id}.{meta.thumb_ext}",
+                first_seen=meta.first_seen,
+                last_seen=meta.last_seen,
+                source_count=meta.source_count,
+                source_urls=list(meta.source_urls or []),
+                caption=meta.caption or "",
+                content_phash=meta.phash,
+                **extra,
+            )
+
+        # face: same person anywhere in the library (FaceCheck-style)
+        if query_faces and face.available:
+            try:
+                candidates = [
+                    (meta.id, emb)
+                    for meta in images
+                    if meta.face_model == FaceId.MODEL_TAG
+                    for emb in (meta.face_embeddings or [])
+                ]
+                best: dict[int, float] = {}
+                for qemb in query_faces:
+                    for sim, image_id in face.match_identity(qemb, candidates):
+                        best[image_id] = max(sim, best.get(image_id, 0.0))
+                for image_id, sim in sorted(best.items(), key=lambda t: -t[1])[: limit * 2]:
+                    meta = by_id[image_id]
+                    conf, tier = face.confidence_tier(sim)
+                    out.append(_wrap(
+                        meta, sim, "face-" + tier, "face",
+                        confidence=conf, face_sim=round(float(sim), 4),
+                        face_tier=tier, ai_modalities=["face"],
+                        note="same person",
+                    ))
+                    seen.add(image_id)
+            except Exception as exc:  # noqa: BLE001 — AI layer best-effort
+                child_logger("imify.api").warning("face grid failed", extra={"error": str(exc)})
+
+        # clip: visually similar content ("what else is like this")
+        if query_clip and clip.available:
+            try:
+                scored = [
+                    (meta, clip.match(query_clip, meta.clip_embedding))
+                    for meta in images
+                    if meta.id not in seen and meta.clip_embedding
+                ]
+                scored.sort(key=lambda t: -t[1])
+                for meta, sim in scored[:limit]:
+                    if sim < settings.clip_similar_min_sim:
+                        break
+                    out.append(_wrap(
+                        meta, 0.3 * sim, "similar", "similar",
+                        confidence=int(round(sim * 100)),
+                        clip_sim=round(float(sim), 4), ai_modalities=["clip"],
+                    ))
+                    seen.add(meta.id)
+            except Exception as exc:  # noqa: BLE001
+                child_logger("imify.api").warning("clip grid failed", extra={"error": str(exc)})
+
+        # ocr: match the visible text in the query against indexed OCR
+        ocr = _OE(enabled=settings.ocr_enabled, lang=settings.ocr_lang)
+        if ocr.available and query_img is not None:
+            try:
+                qtext = (ocr.extract(query_img) or "").lower()
+                qtokens = sorted({t for t in qtext.split() if len(t) > 2})
+                if len(qtokens) >= 2:
+                    for meta in images:
+                        if meta.id in seen or not meta.ocr_text:
+                            continue
+                        mtokens = set(meta.ocr_text.lower().split())
+                        hits = sum(1 for t in qtokens if t in mtokens)
+                        if hits >= max(2, (len(qtokens) + 1) // 2):
+                            out.append(_wrap(
+                                meta, 0.2 * hits / len(qtokens), "similar", "ocr",
+                                confidence=int(round(100 * hits / len(qtokens))),
+                                ai_modalities=["ocr"], note=f"{hits} words of on-image text matched",
+                            ))
+                            seen.add(meta.id)
+            except Exception as exc:  # noqa: BLE001
+                child_logger("imify.api").warning("ocr grid failed", extra={"error": str(exc)})
+
+        out.sort(key=lambda r: (MATCH_FAMILY_RANK.get(r.match_type, 3), -r.score))
+        return out[: limit * 3]
+
     google = google or GoogleImagesReverse(settings.proxify_fetch_url)
     bing = bing or BingImagesReverse(
         proxify_fetch_url=settings.proxify_fetch_url,
@@ -204,6 +352,23 @@ def build_api(
                     else None,
                 },
             },
+            "face": {
+                "enabled": face.available,
+                "provider": face.provider,
+                "images_with_faces": sum(1 for m in repo.all_images() if m.face_embeddings),
+                "images": repo.image_count(),
+            },
+            "clip": {
+                "enabled": clip.available,
+                "provider": clip.provider,
+                "images_embedded": sum(1 for m in repo.all_images() if m.clip_embedding),
+                "images": repo.image_count(),
+            },
+            "enhance": {
+                "enabled": enhancer.enabled,
+                "available": enhancer.available,
+                "blur_limit": settings.enhance_blur_limit,
+            },
             "uptime_s": round(time.time() - indexer.status.started) if indexer.status.started else 0,
         }
 
@@ -232,6 +397,11 @@ def build_api(
         # ---- acquire query image -------------------------------------
         query_bytes: bytes | None = None
         query_public_url: str = ""
+        query_clip: list[float] | None = None
+        query_faces: list[dict] = []  # [{embedding, bbox, confidence}]
+        img = None
+        enhance_info: dict = {}
+        _enh_img = None
         if file is not None:
             query_bytes = file.file.read(settings.image_max_bytes + 1)
             if len(query_bytes) > settings.image_max_bytes:
@@ -279,6 +449,9 @@ def build_api(
             }
             if meta.url.startswith(("http://", "https://")):
                 query_public_url = meta.url
+            # AI layers (face / CLIP / geometry) need pixels: use the best
+            # local copy (original upload or thumbnail) — no network.
+            img = local_pixels(settings, meta)
         else:
             raise HTTPException(400, "provide file, image_url or image_id")
 
@@ -287,6 +460,26 @@ def build_api(
             if img is None:
                 raise HTTPException(422, "could not decode image")
             query_features = extract_features(img, query_bytes)
+            # Blur restore (Opt-in): if the query is a blurry photo, sharpen it
+            # with Real-ESRGAN x4 + BiRefNet BEFORE hashing and web upload so a
+            # smile/blur no longer hashes as "sea". When enhance_before_web_upload
+            # is set, the engines also receive the sharpened bytes.
+            enhance_info: dict = {}
+            _enh_img: object = None
+            if enhancer and enhancer.enabled and enhancer.available and enhancer.needs_enhance(img):
+                _enh, _was, _info = enhancer.enhance(img)
+                if _was:
+                    _buf = io.BytesIO()
+                    _enh.convert("RGB").save(_buf, format="JPEG", quality=95)
+                    _enhanced_bytes = _buf.getvalue()
+                    _enh_img = decode_image(_enhanced_bytes) or _enh
+                    query_features = extract_features(_enh_img, _enhanced_bytes)
+                    if settings.enhance_before_web_upload:
+                        query_bytes = _enhanced_bytes
+                    enhance_info = _info
+            # CLIP semantic gate: embed the query once so web candidates can be
+            # content-checked during verification (two different logos that
+            # happen to hash close must NOT verify as a match).
             # Persist the upload NOW so the live web layer has a public URL to
             # hand to reverse engines — but LOCAL indexing is deferred until
             # the search verdict below: a failed search must never grow the
@@ -299,26 +492,69 @@ def build_api(
                     if settings.public_base_url:
                         query_public_url = f"{settings.public_base_url.rstrip('/')}/uploads/{_name}"
 
+        # Query-side AI signals, computed ONCE and reused by the local AI grid
+        # and by every web candidate's verification: CLIP (semantic gate +
+        # "similar"), faces (FaceCheck identity), pixels for geometry.
+        ai_img = (_enh_img or img) if enhance_info else img
+        if ai_img is not None:
+            if clip.available:
+                query_clip = clip.embed_image(ai_img)
+            if face.available:
+                try:
+                    query_faces = face.embed_image(ai_img)
+                except Exception:  # noqa: BLE001 — face layer is best-effort
+                    query_faces = []
+        query_face_embs = [f["embedding"] for f in query_faces]
+
         repo.incr_stat("searches")
         repo.push_history(
             {"t": time.time(), "mode": mode, "image_url": image_url or "", "image_id": image_id, "results": 0}
         )
 
-        # ---- 1. own index first (SearchOS: "found in local -> serve local") --
+        # ---- 1. own index first (fast) -------------------------------------
         providers = ["local"]
         degraded: list[str] = []
-        local_results = matcher.search_local(query_features, mode if mode != "color" else "best", num_results * 2)
+        local_results = matcher.search_local(
+            query_features, mode if mode != "color" else "best", num_results * 2, query_clip=query_clip
+        )
         if mode == "color":
             color_results = matcher.search_color(query_features, num_results * 2)
             if color_results:
                 local_results = color_results
+
+        # ---- 1b. AI layers feed the SAME grid (not separate endpoints) -----
+        # Face-ID / CLIP / OCR historically lived in their own /v1/search/* -
+        # but a blurry person photo or a logo with text never surfaced in the
+        # main grid. Merge each available layer's LOCAL matches into this same
+        # ranked list (an "ai" provider) so one search answers with copies,
+        # semantic-similar content AND the same face/text — never hashes only.
+        if ai_img is not None and mode in ("best", "exact", "ai"):
+            # crops / edits of the query inside the own index (keypoints)
+            _known = {int(r.image_id) for r in local_results if r.image_id is not None}
+            if image_id is not None:
+                _known.add(image_id)
+            _geo = matcher.search_local_geometric(ai_img, query_clip, exclude=_known)
+            if _geo:
+                local_results.extend(_geo)
+                local_results.sort(key=lambda r: (MATCH_FAMILY_RANK.get(r.match_type, 3), -r.score))
+            _ai_grid = _local_ai_grid(
+                ai_img,
+                known={int(r.image_id) for r in local_results if r.image_id is not None}
+                | ({image_id} if image_id is not None else set()),
+                query_faces=query_face_embs,
+                query_clip=query_clip,
+            )
+            if _ai_grid:
+                local_results.extend(_ai_grid)
+                providers.append("ai")
 
         # ---- 2. thin/empty local coverage -> live web reverse -----------------
         # SearchOS ladder: local first -> SearXNG -> Google via proxify.
         # If every provider is down it degrades and the local index still
         # answers ("SearXNG down -> scan local only").
         web_results: list[SearchResult] = []
-        verified_web: list[SearchResult] = []
+        verified_web: list[SearchResult] = []  # confirmed: copies + same face
+        similar_web: list[SearchResult] = []  # CLIP leads (Google-Lens "similar")
         unverified_web: list[SearchResult] = []
         web_cached = False
         fallback = "local"
@@ -338,9 +574,13 @@ def build_api(
             cached_results = repo.get_web_results(sha256, settings.web_results_cache_ttl_seconds)
             if cached_results:
                 web_cached = True
-                web_results = [SearchResult(**r) for r in cached_results]
-                verified_web = [r for r in web_results if r.match_type != "unverified"]
-                unverified_web = [r for r in web_results if r.match_type == "unverified"]
+                all_cached = [SearchResult(**r) for r in cached_results]
+                verified_web = [r for r in all_cached if r.confirmed]
+                similar_web = [r for r in all_cached if r.match_type == "similar"]
+                unverified_web = [r for r in all_cached if r.match_type == "unverified"]
+                # Cached unverified candidates must pass the SAME admission
+                # gate below as fresh ones — never dumped into the grid.
+                web_results = verified_web + similar_web
                 if verified_web:
                     providers.append("web")
                     fallback = "web"
@@ -366,49 +606,39 @@ def build_api(
                     settings.google_upload_enabled or settings.bing_upload_enabled or settings.yandex_upload_enabled
                 ):
                     # Circle-to-search byte-upload path: the image has NO public
-                    # URL, so the raw pixels are uploaded directly to an engine
-                    # that accepts them. Yandex first (least-censored, returns
-                    # face/people matches Google suppresses, browser POST proven),
-                    # then Bing Visual Search, then Google Lens through proxify.
-                    # URL-based reverse engines CANNOT see a private-box image —
-                    # they return visually-similar junk — so byte-upload is the
-                    # only honest path here.
+                    # URL, so the raw pixels are uploaded directly to each engine
+                    # that accepts them. ALL engines are asked in PARALLEL within
+                    # the shared web-phase budget (TinEye model: no single engine
+                    # sees the whole web) and every candidate is merged — Bing's
+                    # visually-similar junk never silences Yandex/Google. The
+                    # fused-hash matcher judges each candidate afterwards.
                     up_name = (file.filename if file else None) or "image.jpg"
-                    hits: list[ImageHit] = []
-                    if settings.yandex_upload_enabled:
-                        try:
-                            hits = yandex.search_upload(query_bytes, filename=up_name)
-                            repo.record_provider("yandex-upload", ok=True)
-                        except Exception as exc:  # noqa: BLE001 — degrade, never fail the search
-                            repo.record_provider("yandex-upload", ok=False)
-                            degraded.append("provider:yandex-upload")
-                            child_logger("imify.api", event="yandex_upload_degraded").warning(
-                                "yandex-upload degraded", extra={"error": str(exc)}
+                    up_type = (file.content_type if file else None) or "image/jpeg"
+                    # SearXNG is URL-based (no raw-byte upload), so hand it a
+                    # copy the app itself serves back to it over loopback
+                    # (SearXNG and the app both run on this box). Empty when no
+                    # local upload exists (e.g. image_id replay) -> SearXNG
+                    # simply degrades instead of failing the merge.
+                    local_url = query_public_url
+                    if not local_url and file is not None:
+                        local_url = f"{str(request.base_url).rstrip('/')}/uploads/{_persist_upload(settings, query_bytes, query_features.get('sha256') or '', up_name)}"
+                    hits, hit_by_engine = _byte_upload_all(
+                        settings, yandex, bing, google, searx,
+                        query_bytes, up_name, up_type,
+                        image_url=local_url,
+                        phase_start=phase_start,
+                        # leave time for verification inside the same budget
+                        budget=settings.web_phase_budget_seconds * 0.7,
+                        face_crop=_face_crop_bytes(settings, ai_img, query_faces),
+                    )
+                    # record per-provider success so success-rate metrics are honest
+                    for eng, ok in hit_by_engine.items():
+                        repo.record_provider(f"{eng}-upload", ok=ok)
+                        if not ok:
+                            degraded.append(f"provider:{eng}-upload")
+                            child_logger("imify.api", event=f"{eng}_upload_degraded").warning(
+                                f"{eng}-upload degraded", extra={"error": "no candidates"}
                             )
-                            hits = []
-                    if not hits and settings.bing_upload_enabled:
-                        try:
-                            hits = bing.search_upload(query_bytes, filename=up_name)
-                            repo.record_provider("bing-upload", ok=True)
-                        except Exception as exc:  # noqa: BLE001 — degrade, never fail the search
-                            repo.record_provider("bing-upload", ok=False)
-                            degraded.append("provider:bing-upload")
-                            child_logger("imify.api", event="bing_upload_degraded").warning(
-                                "bing-upload degraded", extra={"error": str(exc)}
-                            )
-                            hits = []
-                    if not hits and settings.google_upload_enabled:
-                        try:
-                            up_type = (file.content_type if file else None) or "image/jpeg"
-                            hits = google.search_upload(query_bytes, filename=up_name, content_type=up_type)
-                            repo.record_provider("google-upload", ok=True)
-                        except Exception as exc:  # noqa: BLE001 — degrade, never fail the search
-                            repo.record_provider("google-upload", ok=False)
-                            degraded.append("provider:google-upload")
-                            child_logger("imify.api", event="google_upload_degraded").warning(
-                                "google-upload degraded", extra={"error": str(exc)}
-                            )
-                            hits = []
                 else:
                     degraded.append("web_needs_public_url")
                     hits = []
@@ -424,40 +654,40 @@ def build_api(
                         settings.web_phase_budget_seconds - (time.monotonic() - phase_start),
                     )
                     web_results = matcher.verify_web_hits(
-                        query_features, hits, limit=num_results * 2, budget_seconds=verify_budget
+                        query_features,
+                        hits,
+                        limit=num_results * 2,
+                        budget_seconds=verify_budget,
+                        query_clip=query_clip,
+                        query_img=ai_img,
+                        query_faces=query_face_embs,
                     )
-                    verified_web = [r for r in web_results if r.match_type != "unverified"]
+                    verified_web = [r for r in web_results if r.confirmed]
+                    similar_web = [r for r in web_results if r.match_type == "similar"]
                     unverified_web = [r for r in web_results if r.match_type == "unverified"]
                     # Cache the outcome so the next search of this exact image
-                    # is served instantly (real-time). Verified matches live
-                    # longer (24h, tracker refreshes them); unverified-only
-                    # outcomes are cached briefly (1h) so repeat searches of
-                    # "nothing found" images don't re-crawl the whole web.
-                    if verified_web:
+                    # is served instantly. Confirmed outcomes live 24h (the
+                    # tracker refreshes them); lead-only outcomes 1h so repeat
+                    # searches of "nothing found" images don't re-crawl.
+                    if web_results:
                         repo.set_web_results(
                             sha256,
-                            [r.to_dict() for r in verified_web],
-                            settings.web_results_cache_ttl_seconds,
+                            [r.to_dict() for r in web_results],
+                            settings.web_results_cache_ttl_seconds
+                            if verified_web
+                            else min(settings.web_results_cache_ttl_seconds, 3600),
                         )
-                    elif unverified_web:
-                        repo.set_web_results(
-                            sha256,
-                            [r.to_dict() for r in unverified_web],
-                            min(settings.web_results_cache_ttl_seconds, 3600),
-                        )
-                    # learn (ONLY when requested — on-the-fly default keeps storage
-                    # bounded): verified matches are recorded as SOURCE LINKS on the
-                    # canonical image entry (TinEye model — one image + the list of
-                    # sites carrying it), not re-fetched into new raw copies. The
-                    # raw bytes are only stored once; every confirmed site becomes
-                    # a link. This is what makes "which sites show my image" cheap.
+                    # learn (ONLY when requested — on-the-fly default keeps
+                    # storage bounded). Copies of the image become SOURCE LINKS
+                    # on the canonical entry (TinEye: one image + every site
+                    # carrying it); other photos of the same person become new
+                    # index entries (the FaceCheck asset: an index of faces).
                     if learn and verified_web:
                         canonical_id = _canonical_image_id(repo, query_features)
-                        if canonical_id is not None:
-                            for r in verified_web:
+                        for r in verified_web:
+                            if canonical_id is not None and r.match_type in COPY_MATCH_TYPES:
                                 repo.add_source_link(canonical_id, r.url, r.page_url, r.title)
-                        else:
-                            for r in verified_web:
+                            else:
                                 repo.enqueue_pending(
                                     r.url,
                                     {"page_url": r.page_url, "title": r.title, "engine": r.engine, "query": "web-reverse"},
@@ -465,10 +695,10 @@ def build_api(
                     if verified_web:
                         providers.append("web")
                         fallback = "web"
-                    elif unverified_web:
-                        # candidates existed but none hash-matched -> honest "not found"
+                    elif similar_web or unverified_web:
+                        # candidates existed but none was confirmed -> honest "not found"
                         degraded.append("web_candidates_unverified")
-                    web_results = verified_web
+                    web_results = verified_web + similar_web
 
         # ---- 2b. background tracker for every NEW upload ---------------------
         # The bg crawler keeps reverse-searching the upload across the whole
@@ -486,22 +716,55 @@ def build_api(
                 query_features,
                 query_public_url,
                 learn=learn,
-                verified=bool(verified_web),
+                verified=any(r.match_type in ("exact", "near") for r in verified_web),
+                verified_web=[r for r in verified_web if r.match_type in ("exact", "near")],
             )
 
         # ---- 3. fusion + response ("search not found" when nothing matches) ----
         fused = fuse_results(local_results, web_results) if web_results else local_results
+        # Consolidate multiple URLs/sites carrying the SAME photographic content
+        # (same perceptual hash → genuine near-duplicate re-encodes/downloads)
+        # into ONE result whose source list grows — "found on N sites". Different
+        # images (even visually similar ones) have different phashes and stay
+        # separate, so the grid never floods with 4 tiles of one image.
+        fused = consolidate_duplicates(
+            fused,
+            settings.search_dedup_threshold,
+            clip=clip,
+            clip_threshold=settings.search_dedup_clip_threshold,
+        )
         results = fused[:num_results]
-        # unverified candidates are listed AFTER confirmed matches, clearly
-        # flagged — they never count toward "found" (only hash-verified
-        # matches confirm a site shows the image).
-        if unverified_web:
+        # Reference-RIS behavior: engines return candidate PREVIEWS, but only
+        # the ones that are plausibly the same image belong in the grid. Bing
+        # visual-search (and sometimes Yandex) returns visually-similar junk
+        # (animal/girl previews for a company logo) that must not be shown as a
+        # match. So unverified candidates are admitted ONLY if (a) the pixels
+        # actually decoded (they have a thumb, so they render) and (b) their
+        # perceptual distance is within a tight similarity window. Anything
+        # farther is noise — dropped, not flagged. They are still listed after
+        # confirmed matches and never count toward "found".
+        # Reference-RIS behavior: engines return candidate PREVIEWS, but only
+        # plausible ones belong in the grid. With CLIP live every candidate
+        # was already judged on content — an unverified one failed hash,
+        # geometry, face AND similarity, so it is noise and stays out. Without
+        # CLIP, fall back to a tight perceptual window (Bing previews are
+        # penalized for their junk history). Listed after everything else and
+        # never counted as found.
+        if unverified_web and settings.web_verify_candidates:
             seen = {r.url for r in results}
+            by_sim: list[tuple[float, SearchResult]] = []
             for r in unverified_web:
-                if r.url not in seen:
-                    results.append(r)
-                    seen.add(r.url)
-        found = any(r.match_type != "unverified" for r in results)
+                if r.url in seen or r.clip_sim is not None or r.hamming is None or not r.thumb:
+                    continue
+                pen = settings.web_engine_bing_penalty if r.engine and "bing" in r.engine.lower() else 1.0
+                by_sim.append(((r.hamming / 64.0) * pen, r))
+            by_sim.sort(key=lambda t: t[0])
+            for eff, r in by_sim:
+                if eff > settings.web_unverified_max_fused:
+                    break  # sorted: all remaining are even less similar
+                results.append(r)
+                seen.add(r.url)
+        found = any(r.confirmed for r in results)
         if not found:
             fallback = "none"
         repo.incr_stat("search_results", len(results))
@@ -526,6 +789,344 @@ def build_api(
             cached=web_cached,
             results=[r.to_dict() for r in results],
         )
+        # reverseimagesearch / reversely grouping — feed the UI per-engine tabs
+        # and Similar/Duplicates buckets over the final ranked list.
+        rd = [r.to_dict() for r in results]
+        response.by_engine = {}
+        for r in rd:
+            eng = (r.get("engine") or "").strip() or ("index" if r.get("source") == "local" else "web")
+            response.by_engine.setdefault(eng, []).append(r)
+        response.by_category = {"duplicate": [], "similar": [], "candidate": []}
+        for r in rd:
+            cat = r.get("category") or ("duplicate" if r.get("match_type") in ("exact", "near") else "candidate")
+            if cat not in response.by_category:
+                response.by_category[cat] = []
+            response.by_category[cat].append(r)
+        return response.to_dict()
+
+    # --------------------------------------------------------- AI text search
+    @router.post("/v1/search/text")
+    def search_by_text(
+        request: Request,
+        query: str = Form(...),
+        num_results: int = Form(40),
+        _: dict | None = Depends(_require_user),
+    ):
+        """Natural-language search over the AI-captioned index.
+
+        Matches the query against every indexed image's caption using embedding
+        cosine similarity (self-hosted Ollama). Requires ``AI_OLLAMA_URL`` +
+        an embedding model and captioned images (``AI_CAPTION_ON_INDEX``).
+        Degrades honestly: 503 when the AI layer is off or the server is down.
+        """
+        started = time.monotonic()
+        identity = _identity(request)
+        _rate_limit(request, identity)
+        if not ai.enabled or not ai.available:
+            raise HTTPException(503, "AI layer unavailable (set AI_OLLAMA_URL and start Ollama)")
+        qvec = ai.embed(text=query)
+        if not qvec:
+            raise HTTPException(503, "AI embedding failed (check AI_EMBED_MODEL)")
+        floor = settings.ai_text_min_sim  # drop semantically-unrelated captions
+        scored: list[tuple[float, dict]] = []
+        for meta in repo.all_images():
+            cvec = meta.caption_embedding
+            # fallback for entries indexed before caption-embedding existed:
+            # embed the caption once here (best-effort) rather than skip it.
+            if not cvec and meta.caption:
+                cvec = ai.embed(text=meta.caption)
+            if not cvec:
+                continue
+            sim = _cosine(qvec, cvec)
+            if sim < floor:
+                continue
+            scored.append((sim, _public_meta(meta)))
+        scored.sort(key=lambda t: -t[0])
+        top = scored[: max(1, min(num_results, settings.max_num_results))]
+        results = []
+        for sim, meta in top:
+            d = dict(meta)
+            d["score"] = round(float(sim), 4)
+            d["thumb"] = f"/img/{meta['id']}.{meta.get('thumb_ext') or 'jpg'}"
+            d["match_type"] = "text"
+            d["page_url"] = meta.get("page_url") or meta.get("url", "")
+            d["category"] = "similar"
+            d["confidence"] = int(round(max(0.0, min(1.0, float(sim))) * 100))
+            results.append(d)
+        response = SearchResponse(
+            mode="text",
+            total=len(scored),
+            took_ms=int((time.monotonic() - started) * 1000),
+            providers=["ai"],
+            found=bool(results),
+            fallback="local",
+            text_query=True,
+            results=results,
+        )
+        return response.to_dict()
+
+    # --------------------------------------------------------- OCR text search
+    @router.post("/v1/search/ocr")
+    def search_by_ocr_text(
+        request: Request,
+        query: str = Form(...),
+        num_results: int = Form(40),
+        _: dict | None = Depends(_require_user),
+    ):
+        """Keyword search over OCR text extracted from indexed images.
+
+        Matches the query tokens against every indexed image's ``ocr_text``
+        (visible text in logos/memes/screenshots). Simple TF-ish scoring — no
+        external services, pure string matching. 503 when OCR is disabled or
+        tesseract is not installed.
+        """
+        started = time.monotonic()
+        identity = _identity(request)
+        _rate_limit(request, identity)
+        from app.ocr import OcrExtractor
+
+        ocr = OcrExtractor(enabled=settings.ocr_enabled, lang=settings.ocr_lang)
+        if not ocr.available:
+            raise HTTPException(503, "OCR unavailable (set OCR_ENABLED=true and install tesseract)")
+        tokens = [t.lower() for t in query.split() if len(t) > 1]
+        if not tokens:
+            raise HTTPException(400, "query too short")
+        scored: list[tuple[float, dict]] = []
+        for meta in repo.all_images():
+            if not meta.ocr_text:
+                continue
+            text_l = meta.ocr_text.lower()
+            hits = sum(1 for t in tokens if t in text_l)
+            if hits == 0:
+                continue
+            score = hits / len(tokens)  # fraction of query tokens found
+            scored.append((score, _public_meta(meta)))
+        scored.sort(key=lambda t: -t[0])
+        top = scored[: max(1, min(num_results, settings.max_num_results))]
+        results = []
+        for sim, meta in top:
+            d = dict(meta)
+            d["score"] = round(float(sim), 4)
+            d["match_type"] = "ocr"
+            d["thumb"] = f"/img/{meta['id']}.{meta.get('thumb_ext') or 'jpg'}"
+            d["page_url"] = meta.get("page_url") or meta.get("url", "")
+            d["category"] = "similar"
+            d["confidence"] = int(round(max(0.0, min(1.0, float(sim))) * 100))
+            results.append(d)
+        response = SearchResponse(
+            mode="ocr",
+            total=len(scored),
+            took_ms=int((time.monotonic() - started) * 1000),
+            providers=["ocr"],
+            found=bool(results),
+            fallback="local",
+            results=results,
+        )
+        return response.to_dict()
+
+    # ---------------------------------------------- Full-text search
+    @router.post("/v1/search/fulltext")
+    def search_by_fulltext(
+        request: Request,
+        query: str = Form(...),
+        num_results: int = Form(40),
+        _: dict | None = Depends(_require_user),
+    ):
+        """Keyword search over EVERY text field on the index entry.
+
+        Matches the query tokens (case-insensitive substring) against the AI
+        caption, OCR text, title and clipped filename of every indexed image —
+        so a search for a quoted phrase or a set of keywords hits the full
+        index regardless of which layer produced the text. Pure string scoring,
+        no external service (works with or without AI/OCR enabled).
+
+        The returned score is the fraction of query tokens found across the
+        entry's combined text.
+        """
+        started = time.monotonic()
+        identity = _identity(request)
+        _rate_limit(request, identity)
+        # Caption boilerplate + English stopwords. Without filtering, common
+        # words ("image", "with", "a", "the", "shows", "depicts") appear in
+        # every AI caption and fulltext search returns the WHOLE index for
+        # almost any query.
+        _STOP = frozenset(
+            "a an the and or but if because of in on at by for with without from to"
+            " is are was were be been being has have had do does did will would shall"
+            " should can could may might must not no yes i you he she it we they them"
+            " this that these those there here image picture photo photograph depicts"
+            " shows features displaying presents scene subject background setting showing"
+            " features of front against over under between during through across into"
+            " out up down off again further once also some any all both each few more"
+            " most other own same so than too very s t can just don should now".split()
+        )
+        tokens = [t.lower() for t in query.split() if len(t) > 2 and t.lower() not in _STOP]
+        if not tokens:
+            raise HTTPException(400, "query has no meaningful keywords")
+        min_hits = max(1, math.ceil(len(tokens) / 2))  # majority of meaningful tokens must hit
+        scored: list[tuple[float, dict]] = []
+        for meta in repo.all_images():
+            caption = (meta.caption or "").lower()
+            ocr = (meta.ocr_text or "").lower()
+            title = (meta.title or "").lower()
+            name = Path(meta.url or "").name.lower().rsplit(".", 1)[0].replace("-", " ").replace("_", " ")
+            haystack = f" {caption} {ocr} {title} {name} "
+            hits = sum(1 for t in tokens if t in haystack)
+            if hits < min_hits:
+                continue
+            score = hits / len(tokens)
+            scored.append((score, _public_meta(meta)))
+        scored.sort(key=lambda t: -t[0])
+        top = scored[: max(1, min(num_results, settings.max_num_results))]
+        results = []
+        for sim, meta in top:
+            d = dict(meta)
+            d["score"] = round(float(sim), 4)
+            d["match_type"] = "fulltext"
+            d["thumb"] = f"/img/{meta['id']}.{meta.get('thumb_ext') or 'jpg'}"
+            d["page_url"] = meta.get("page_url") or meta.get("url", "")
+            d["category"] = "similar"
+            d["confidence"] = int(round(max(0.0, min(1.0, float(sim))) * 100))
+            results.append(d)
+        response = SearchResponse(
+            mode="fulltext",
+            total=len(scored),
+            took_ms=int((time.monotonic() - started) * 1000),
+            providers=["local"],
+            found=bool(results),
+            fallback="local",
+            results=results,
+        )
+        return response.to_dict()
+
+    # --------------------------------------------------------- Face-ID search
+    @router.post("/v1/search/face")
+    def search_by_face(
+        request: Request,
+        file: UploadFile = File(...),
+        num_results: int = Form(40),
+        _: dict | None = Depends(_require_user),
+    ):
+        """Match a face in the uploaded photo across the whole indexed library.
+
+        Detects + embeds the face (ArcFace, CPU) and ranks every indexed
+        image that has a detected face by embedding cosine similarity, with
+        FaceCheck-style confidence tiers. Returns the matched images grouped by
+        "this person appears here". 503 when Face-ID is disabled / model not
+        downloaded / onnxruntime missing.
+        """
+        started = time.monotonic()
+        identity = _identity(request)
+        _rate_limit(request, identity)
+        if not face.available:
+            raise HTTPException(503, "Face-ID unavailable (set FACE_ID_ENABLED=true and install opencv + onnxruntime)")
+        raw = file.file.read(settings.image_max_bytes + 1)
+        if len(raw) > settings.image_max_bytes:
+            raise HTTPException(413, "image too large")
+        img = decode_image(raw)
+        if img is None:
+            raise HTTPException(422, "could not decode image")
+        faces = face.embed_image(img)
+        if not faces:
+            raise HTTPException(404, "no face detected in the uploaded image")
+        # every query face (group photos) against every current-pipeline
+        # library face; each image keeps its best similarity
+        candidates = [
+            (meta.id, emb)
+            for meta in repo.all_images()
+            if meta.face_model == FaceId.MODEL_TAG
+            for emb in (meta.face_embeddings or [])
+        ]
+        best: dict[int, float] = {}
+        for qf in faces:
+            for sim, image_id in face.match_identity(qf["embedding"], candidates):
+                best[image_id] = max(sim, best.get(image_id, 0.0))
+        results = []
+        for image_id, sim in best.items():
+            meta = repo.get_image(image_id)
+            if meta is None:
+                continue
+            conf, tier = face.confidence_tier(sim)
+            d = _public_meta(meta)
+            d["confidence"] = conf
+            d["face_confidence"] = conf
+            d["face_tier"] = tier
+            d["face_sim"] = round(sim, 4)
+            d["score"] = round(float(sim), 4)
+            d["match_type"] = "face"
+            d["category"] = "face-" + tier
+            d["thumb"] = f"/img/{meta.id}.{meta.thumb_ext}"
+            d["image_id"] = meta.id
+            results.append(d)
+        results.sort(key=lambda r: -r["score"])
+        results = results[: max(1, min(num_results, settings.max_num_results))]
+        response = SearchResponse(
+            mode="face",
+            total=len(results),
+            took_ms=int((time.monotonic() - started) * 1000),
+            providers=["face"],
+            found=bool(results),
+            fallback="local",
+            results=results,
+        )
+        return response.to_dict()
+
+    # ------------------------------------------------------- CLIP content search
+    @router.post("/v1/search/clip")
+    def search_by_clip(
+        request: Request,
+        file: UploadFile = File(...),
+        num_results: int = Form(40),
+        _: dict | None = Depends(_require_user),
+    ):
+        """Semantic content search — "what else is like this scene".
+
+        Perceptual hashes only separate copies of the SAME image; CLIP ranks
+        the whole library by semantic similarity (a homelab photo matches
+        another homelab photo, not a black-dog photo). Embeds the uploaded
+        image (ViT-B/32 on CPU) and scores every indexed image that has a CLIP
+        embedding by cosine similarity. 503 when CLIP is disabled.
+        """
+        started = time.monotonic()
+        identity = _identity(request)
+        _rate_limit(request, identity)
+        if not clip.available:
+            raise HTTPException(503, "CLIP unavailable (set CLIP_ENABLED=true and install onnxruntime)")
+        raw = file.file.read(settings.image_max_bytes + 1)
+        if len(raw) > settings.image_max_bytes:
+            raise HTTPException(413, "image too large")
+        img = decode_image(raw)
+        if img is None:
+            raise HTTPException(422, "could not decode image")
+        qvec = clip.embed_image(img)
+        if not qvec:
+            raise HTTPException(503, "CLIP embedding failed (model did not produce a vector)")
+        scored: list[tuple[float, dict]] = []
+        for meta in repo.all_images():
+            if not meta.clip_embedding:
+                continue
+            sim = clip.match(qvec, meta.clip_embedding)
+            if sim >= settings.clip_similar_min_sim:
+                d = _public_meta(meta)
+                d["thumb"] = f"/img/{meta.id}.{meta.thumb_ext}"
+                d["image_id"] = meta.id
+                d["confidence"] = int(round(sim * 100))
+                d["clip_sim"] = round(float(sim), 4)
+                d["score"] = round(float(sim), 4)
+                d["match_type"] = "similar"
+                d["category"] = "duplicate" if sim >= settings.clip_same_threshold else "similar"
+                scored.append((sim, d))
+        scored.sort(key=lambda t: -t[0])
+        top = scored[: max(1, min(num_results, settings.max_num_results))]
+        response = SearchResponse(
+            mode="clip",
+            total=len(top),
+            took_ms=int((time.monotonic() - started) * 1000),
+            providers=["clip"],
+            found=bool(top),
+            fallback="local",
+            results=[d for _, d in top],
+        )
         return response.to_dict()
 
     # ------------------------------------------------------------- images
@@ -534,8 +1135,7 @@ def build_api(
         meta = repo.get_image(image_id)
         if meta is None:
             raise HTTPException(404, "image not found")
-        return meta.to_dict()
-
+        return _public_meta(meta)
     @router.get("/v1/history")
     def history(limit: int = 20):
         return repo.list_history(limit)
@@ -562,6 +1162,36 @@ def build_api(
                 enqueued += 1
         indexer.request_discovery()  # kick off immediately, never block the request
         return {"created": created, "count": len(created), "urls_enqueued": enqueued}
+
+    @router.post("/v1/admin/face/backfill")
+    def admin_face_backfill(
+        limit: int = 50,
+        force: bool = False,
+        admin: dict = Depends(_require_admin),
+    ):
+        """(Re-)embed faces for index entries that have none yet or were
+        embedded by an older face pipeline (``force`` re-embeds everything).
+
+        The indexer also does this continuously in the background; this is
+        the "do it now" button. Uses the original upload when available,
+        else the stored thumbnail. Bounded by ``limit`` per call.
+        """
+        if not face.available:
+            raise HTTPException(503, "Face-ID unavailable (install opencv + onnxruntime, enable FACE_ID_ENABLED)")
+        done = indexer.backfill_ai(limit=limit, force_faces=force)
+        return {"scanned": done["scanned"], "faces_added": done["faces"], "images_embedded": done["clip"], "provider": face.provider}
+
+    @router.post("/v1/admin/clip/backfill")
+    def admin_clip_backfill(
+        limit: int = 50,
+        admin: dict = Depends(_require_admin),
+    ):
+        """Embed CLIP vectors for index entries that lack them (also done
+        continuously in the background by the indexer)."""
+        if not clip.available:
+            raise HTTPException(503, "CLIP unavailable (install onnxruntime, enable CLIP_ENABLED)")
+        done = indexer.backfill_ai(limit=limit)
+        return {"scanned": done["scanned"], "images_embedded": done["clip"], "faces_added": done["faces"], "provider": clip.provider}
 
     @router.get("/v1/admin/queries")
     def admin_queries(admin: dict = Depends(_require_admin)):
@@ -617,7 +1247,7 @@ def build_api(
             ]
         metas.sort(key=lambda m: m.first_seen, reverse=True)
         total = len(metas)
-        page = [m.to_dict() for m in metas[offset : offset + limit]]
+        page = [_public_meta(m) for m in metas[offset : offset + limit]]
         # 64-bit phash as hex string — JS numbers lose precision past 2^53
         for d in page:
             d["phash"] = f"{d['phash']:016x}"
@@ -687,6 +1317,161 @@ def build_api(
 
 
 # ------------------------------------------------------------------ helpers
+_HEAVY_FIELDS = ("face_embeddings", "clip_embedding", "caption_embedding", "color")
+
+
+def _public_meta(meta: ImageMeta) -> dict:
+    """ImageMeta as JSON for clients — without the raw embedding vectors
+    (kilobytes per image that no client uses)."""
+    d = meta.to_dict()
+    for key in _HEAVY_FIELDS:
+        d.pop(key, None)
+    return d
+
+
+def _cosine(a: list[float], b: list[float]) -> float:
+    """Cosine similarity between two float vectors (for AI text search)."""
+    import math
+
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1e-9
+    nb = math.sqrt(sum(x * x for x in b)) or 1e-9
+    return dot / (na * nb)
+
+
+def _byte_upload_all(
+    settings,
+    yandex,
+    bing,
+    google,
+    searx,
+    query_bytes: bytes,
+    up_name: str,
+    up_type: str,
+    image_url: str,
+    phase_start: float,
+    budget: float,
+    face_crop: bytes | None = None,
+) -> tuple[list, dict[str, bool]]:
+    """Run every enabled byte-upload engine in PARALLEL and merge candidates.
+
+    TinEye model: no single engine sees the whole web. Yandex (least-censored,
+    returns faces Google suppresses), Bing Visual Search, Google Lens, and
+    SearXNG are all asked concurrently within the shared web-phase budget, and
+    their candidates are merged (deduped by image URL). A slow or throttled
+    engine degrades on its own instead of blocking the others.
+
+    ``face_crop`` (JPEG bytes of the main face) adds a "yandex-face" task:
+    FaceCheck-style people search — Yandex matches people by the face, so a
+    tight crop of a group/holiday photo finds other photos of that person
+    that the full frame never would. Its candidates are face-verified.
+
+    SearXNG is URL-based (no raw-byte upload), so ``image_url`` must be a copy
+    the app itself can serve back to SearXNG on loopback. Pass ``""`` when none
+    exists — SearXNG is then recorded degraded instead of failing the merge.
+
+    Returns ``(merged_hits, {engine: ok})`` where ok=False means the engine
+    returned nothing, raised, or missed the budget.
+    """
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
+
+    tasks: list[tuple[str, object]] = []
+    if settings.yandex_upload_enabled:
+        tasks.append(("yandex", yandex))
+        if face_crop:
+            tasks.append(("yandex-face", yandex))
+    if settings.bing_upload_enabled:
+        tasks.append(("bing", bing))
+    if settings.google_upload_enabled:
+        tasks.append(("google", google))
+    if settings.searxng_url and image_url and getattr(searx, "available", True):
+        tasks.append(("searx", searx))
+    if not tasks:
+        return [], {}
+
+    per_engine: dict[str, list] = {}
+
+    def _run(engine: str, eng) -> list:
+        if engine == "yandex":
+            return eng.search_upload(query_bytes, filename=up_name)
+        if engine == "yandex-face":
+            return eng.search_upload(face_crop, filename="face.jpg")
+        if engine == "google":
+            return eng.search_upload(query_bytes, filename=up_name, content_type=up_type)
+        if engine == "searx":
+            return eng.reverse_search(image_url)
+        return eng.search_upload(query_bytes, filename=up_name)
+
+    # The budget is enforced for real: on timeout the pool is abandoned
+    # without waiting (a `with` block would block on the slowest engine).
+    pool = ThreadPoolExecutor(max_workers=len(tasks))
+    futures = {pool.submit(_run, e, eng): e for e, eng in tasks}
+    try:
+        remaining = None if budget is None else max(0.5, budget - (time.monotonic() - phase_start))
+        for fut in as_completed(futures, timeout=remaining):
+            engine = futures[fut]
+            try:
+                per_engine[engine] = list(fut.result() or [])
+            except Exception as exc:  # noqa: BLE001 — degrade, never fail the search
+                child_logger("imify.api", event=f"{engine}_upload_errored").warning(
+                    f"{engine}-upload errored", extra={"error": str(exc)}
+                )
+    except TimeoutError:
+        child_logger("imify.api", event="upload_budget").warning(
+            "byte-upload budget exhausted", extra={"pending": [e for f, e in futures.items() if not f.done()]}
+        )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    # merge all candidates, deduped by image URL, INTERLEAVING across engines
+    # so one engine's flood never fills the entire verify cap. Order within
+    # the response is decided by the verifier, not here.
+    merged: list = []
+    seen: set[str] = set()
+    order = ("yandex-face", "yandex", "bing", "google", "searx")
+    lists = [(e, per_engine.get(e, [])) for e in order]
+    max_len = max((len(lst) for _, lst in lists), default=0)
+    for i in range(max_len):
+        for provider, lst in lists:
+            if i >= len(lst):
+                continue
+            hit = lst[i]
+            # SearXNG reports its internal sub-engine ("google images"); tag
+            # hits with the top-level provider so a searx hit never masks a
+            # genuinely failed direct engine in the per-engine tabs.
+            if provider == "searx" and getattr(hit, "engine", ""):
+                try:
+                    hit.engine = "searx"
+                except Exception:  # noqa: BLE001
+                    pass
+            img_src = getattr(hit, "img_src", "") or ""
+            if img_src in seen:
+                continue
+            seen.add(img_src)
+            merged.append(hit)
+
+    hit_by_engine = {e: bool(per_engine.get(e)) for e, _ in tasks}
+    return merged, hit_by_engine
+
+
+def _face_crop_bytes(settings: Settings, img, faces: list[dict]) -> bytes | None:
+    """JPEG of the main face with context, when the photo is NOT already a
+    close-up (then the full upload is the face search). None otherwise."""
+    if not settings.face_crop_upload or img is None or not faces:
+        return None
+    x, y, w, h = faces[0]["bbox"]
+    if (w * h) / float(img.width * img.height) > 0.20:
+        return None  # portrait / selfie: the full image already is the face
+    crop = FaceId.crop_face(img, faces[0]["bbox"])
+    if min(crop.size) < 64:
+        return None
+    buf = io.BytesIO()
+    crop.convert("RGB").save(buf, format="JPEG", quality=92)
+    return buf.getvalue()
+
+
 def _canonical_image_id(repo: Repository, query_features: dict) -> int | None:
     """Find the canonical indexed image for the query (by sha256 or phash),
     or None when it isn't indexed yet — verified web hits then fall back to
@@ -725,6 +1510,7 @@ def _maybe_track_upload(
     query_public_url: str,
     learn: bool = False,
     verified: bool = False,
+    verified_web: list | None = None,
 ) -> str:
     """Continuous-learning hook for a NEW uploaded image.
 
@@ -760,8 +1546,32 @@ def _maybe_track_upload(
         # (or the user explicitly opted in) — the worker fetches it over
         # loopback (request.base_url), no public exposure needed.
         if verified or learn:
-            internal_url = f"{str(request.base_url).rstrip('/')}/uploads/{name}"
-            repo.enqueue_pending(internal_url, {"query": "user-upload", "engine": "upload", "title": file.filename or ""})
+            # Canonical link preference: when the web layer VERIFIED this upload
+            # on a real remote site, index that REMOTE source (url + page_url)
+            # as the canonical — never the loopback copy. Otherwise the indexed
+            # entry's url is http://127.0.0.1:8010/uploads/... and every later
+            # search of the image returns our own dead loopback link instead of
+            # the site that actually hosts it. The worker fetches the remote URL;
+            # the local upload stays only as the on-disk thumb/upload copy.
+            remote = None
+            for r in verified_web or []:
+                u = (r.url or "").strip()
+                if u.startswith(("http://", "https://")) and "127.0.0.1" not in u and "localhost" not in u:
+                    remote = r
+                    break
+            if remote is not None:
+                repo.enqueue_pending(
+                    remote.url,
+                    {
+                        "page_url": remote.page_url or remote.url,
+                        "title": remote.title or file.filename or "",
+                        "engine": "upload",
+                        "query": "user-upload",
+                    },
+                )
+            else:
+                internal_url = f"{str(request.base_url).rstrip('/')}/uploads/{name}"
+                repo.enqueue_pending(internal_url, {"query": "user-upload", "engine": "upload", "title": file.filename or ""})
         local_path = str(Path(settings.uploads_dir) / name)
         if settings.public_base_url:
             reverse_url = f"{settings.public_base_url.rstrip('/')}/uploads/{name}"

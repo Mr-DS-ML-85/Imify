@@ -55,37 +55,64 @@ def test_parse_yandex_markup_fallback():
 
 
 def test_yandex_upload_via_tunnel(monkeypatch):
+    """Byte-upload uses the true two-step flow: POST image-download (raw bytes
+    in memory, no disk download) -> read cbir_id -> GET /images/search?cbir_id=."""
     captured = {}
 
-    def fake_post(url, data, files, timeout, follow_redirects, proxy, headers):
-        captured.update(url=url, data=data, files=files, proxy=proxy)
+    class R:
+        def raise_for_status(self):
+            pass
 
-        class R:
-            def raise_for_status(self):
-                pass
+        status_code = 200
+        text = (
+            '{"cbir_id":"123/abc","namespace":"images-cbir",'
+            '"sizes":{"orig":{"path":"https://avatars.mds.yandex.net/get-images-cbir/123/abc/orig"}}}'
+        )
 
-            status_code = 200
-            text = SAMPLE_CBIR
+    class FakeClient:
+        def __init__(self, *a, **k):
+            captured["client_kwargs"] = k
+            self.follow_redirects = True
 
-        return R()
+        def __enter__(self):
+            return self
 
-    monkeypatch.setattr("app.engines.yandex_images.httpx.post", fake_post)
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, content=None, headers=None, **k):
+            captured.setdefault("posts", []).append((url, bool(content), headers))
+            return R()
+
+        def get(self, url, **k):
+            captured["get_url"] = url
+            return R(text=SAMPLE_CBIR) if False else R2()
+
+    class R2:
+        def raise_for_status(self):
+            pass
+
+        status_code = 200
+        text = SAMPLE_CBIR
+
+    monkeypatch.setattr("app.engines.yandex_images.httpx.Client", FakeClient)
     y = YandexImagesReverse(proxify_fetch_url="", fetch_proxy_url="http://127.0.0.1:8888")
     raw = b"\xff\xd8fakejpeg\x00\x01\xfe"
     hits = y.search_upload(raw, filename="q.jpg")
 
-    assert captured["url"] == "https://yandex.com/images/search"
-    assert captured["proxy"] == "http://127.0.0.1:8888"
-    assert captured["data"]["rpt"] == "imageview"
-    assert captured["files"]["upfile"][0] == "q.jpg"
+    assert captured["client_kwargs"]["proxy"] == "http://127.0.0.1:8888"
+    assert captured["posts"][0][0] == "https://yandex.com/images-apphost/image-download?cbird=37&images_avatars_size=preview&images_avatars_namespace=images-cbir"
+    assert captured["posts"][0][1] is True  # raw bytes posted in-memory
+    assert "cbir_id=123%2Fabc" in captured["get_url"] or "cbir_id=123/abc" in captured["get_url"]
+    assert "rpt=imageview" in captured["get_url"]
     assert any(h.img_src == "https://cdn.example.net/photo2.png" for h in hits)
 
 
 def test_yandex_upload_all_paths_fail(monkeypatch):
-    def fake_post(url, data, files, timeout, follow_redirects, proxy, headers):
+    def boom(*a, **k):
         raise RuntimeError("network down")
 
-    monkeypatch.setattr("app.engines.yandex_images.httpx.post", fake_post)
+    monkeypatch.setattr("app.engines.yandex_images.httpx.Client", boom)
     y = YandexImagesReverse(proxify_fetch_url="", fetch_proxy_url="")
     with pytest.raises(EngineError, match="yandex-upload failed via all paths"):
         y.search_upload(b"\x01")
@@ -203,9 +230,9 @@ def test_yandex_url_reverse_stage1_wins_when_hits(monkeypatch):
 
 
 def test_yandex_upload_tries_proxify_fetch_post(monkeypatch):
-    """Byte-upload routes through proxify /fetch as the PRIMARY stage (browser
-    POST — gui_chrome + wait_selector). Its rendered verdict is authoritative:
-    when it returns hits, the tunnel is never attempted."""
+    """Byte-upload routes through proxify /fetch (browser gui_chrome) as a
+    carrier for the two-step flow: image-download POST -> cbir_id -> GET."""
+    step1 = '{"cbir_id":"44/x","namespace":"images-cbir","sizes":{"orig":{"path":"https://avatars.mds.yandex.net/get-images-cbir/44/x/orig"}}}'
     good = (
         '<script>{"cbir-page":{"content":['
         '{"img_href":"https://cdn.example.com/p.jpg","link":"https://p.com"}'
@@ -213,70 +240,90 @@ def test_yandex_upload_tries_proxify_fetch_post(monkeypatch):
     )
     calls = []
 
-    def fake_post(url, data=None, files=None, timeout=None, follow_redirects=None, proxy=None, headers=None, json=None):
-        # proxify /fetch with json -> good; tunnel POST (files) -> not reached
-        calls.append((url, bool(files), bool(json)))
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
 
-        class R:
-            def raise_for_status(self):
-                pass
+        def __enter__(self):
+            return self
 
-            status_code = 200
-            text = ""
+        def __exit__(self, *a):
+            return False
 
-            def json(self):
-                return {"success": True, "html": good, "strategy_used": "gui_chrome"}
+        def post(self, url, content=None, headers=None, **k):
+            return R(step1, 200)
 
-        return R()
+        def get(self, url, **k):
+            calls.append(url)
+            return R(good, 200)
 
-    monkeypatch.setattr("app.engines.yandex_images.httpx.post", fake_post)
+    class R:
+        def __init__(self, text, status):
+            self.text = text
+            self.status_code = status
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr("app.engines.yandex_images.httpx.Client", FakeClient)
     y = YandexImagesReverse(proxify_fetch_url="http://127.0.0.1:8081", fetch_proxy_url="http://127.0.0.1:8888")
     hits = y.search_upload(b"\xff\xd8fake\x00", filename="q.jpg")
     assert len(hits) == 1
     assert hits[0].img_src == "https://cdn.example.com/p.jpg"
-    assert any(c[2] for c in calls)  # proxify /fetch POST attempted (browser route)
-    assert not any(c[1] for c in calls)  # tunnel NOT attempted — browser verdict won
-    fetch_call = next(c[2] for c in calls if c[2])
-    assert fetch_call
+    assert any("cbir_id=44%2Fx" in u or "cbir_id=44/x" in u for u in calls)
 
 
-def test_yandex_upload_falls_to_tunnel_when_fetch_errors(monkeypatch):
-    """When the browser /fetch route raises (blocked/timeout), the tunnel is
-    attempted next — the ladder still works."""
+def test_yandex_upload_falls_to_tunnel_when_browser_fails(monkeypatch):
+    """When the browser /fetch carrier errors (no cbir id, transport), the
+    tunnel httpx path is attempted next — the ladder still works."""
     good = (
         '<script>{"cbir-page":{"content":['
         '{"img_href":"https://cdn.example.com/t.jpg","link":"https://t.com"}'
         ']}}</script>'
     )
+    step1 = '{"cbir_id":"7/z","namespace":"images-cbir","sizes":{"orig":{"path":"https://avatars.mds.yandex.net/get-images-cbir/7/z/orig"}}}'
     calls = []
 
-    def fake_post(url, data=None, files=None, timeout=None, follow_redirects=None, proxy=None, headers=None, json=None):
-        calls.append((url, bool(files), bool(json)))
-        if json:
-            # proxify /fetch route raises (httpx error) -> degrade, next route
-            import httpx as _httpx
+    def fake_httpx_post(url, json=None, timeout=None, **k):
+        if json is not None:
+            raise RuntimeError("fetch route down")
 
-            class E:
-                def raise_for_status(self):
-                    raise _httpx.ConnectError("fetch route down")
+    class R:
+        def __init__(self, text, status):
+            self.text = text
+            self.status_code = status
 
-                def json(self):
-                    raise ValueError("non-json")
+        def raise_for_status(self):
+            pass
 
-            return E()
+    class FakeClient:
+        def __init__(self, *a, **k):
+            pass
 
-        class R:
-            def raise_for_status(self):
-                pass
+        def __enter__(self):
+            return self
 
-            status_code = 200
-            text = good
+        def __exit__(self, *a):
+            return False
 
-        return R()
+        def post(self, url, content=None, headers=None, **k):
+            calls.append(("post", url))
+            return R(step1, 200)
 
-    monkeypatch.setattr("app.engines.yandex_images.httpx.post", fake_post)
-    y = YandexImagesReverse(proxify_fetch_url="http://127.0.0.1:8081", fetch_proxy_url="http://127.0.0.1:8888")
-    hits = y.search_upload(b"\xff\xd8fake\x00", filename="q.jpg")
+        def get(self, url, **k):
+            calls.append(("get", url))
+            return R(good, 200)
+
+    import app.engines.yandex_images as yi
+
+    real_httpx_post = yi.httpx.post
+    yi.httpx.post = fake_httpx_post
+    try:
+        monkeypatch.setattr("app.engines.yandex_images.httpx.Client", FakeClient)
+        y = YandexImagesReverse(proxify_fetch_url="http://127.0.0.1:8081", fetch_proxy_url="http://127.0.0.1:8888")
+        hits = y.search_upload(b"\xff\xd8fake\x00", filename="q.jpg")
+    finally:
+        yi.httpx.post = real_httpx_post
     assert len(hits) == 1
     assert hits[0].img_src == "https://cdn.example.com/t.jpg"
-    assert any(c[1] for c in calls)  # tunnel attempted as fallback
+    assert any(c[0] == "get" for c in calls)

@@ -181,3 +181,15 @@ class RespClient:
             dist = float(reply[i + 1])
             out.append((vid, dist))
         return out
+
+    def vadd_ns(self, namespace: str, id: int, vector: list[float]) -> None:
+        self.request("VADDNS", namespace, str(id), *[f"{x:.6f}" for x in vector])
+
+    def vsearch_ns(self, namespace: str, k: int, vector: list[float]) -> list[tuple[int, float]]:
+        reply = self.request("VSEARCHNS", namespace, str(k), *[f"{x:.6f}" for x in vector])
+        out: list[tuple[int, float]] = []
+        for i in range(0, len(reply), 2):
+            vid = int(reply[i])
+            dist = float(reply[i + 1])
+            out.append((vid, dist))
+        return out

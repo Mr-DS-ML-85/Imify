@@ -19,9 +19,11 @@ Layers, in order:
 
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
 
@@ -30,7 +32,25 @@ import numpy as np
 
 from app.config import Settings
 from app.features import encode_hash_vector, hamming
-from app.models import ImageMeta, SearchResult
+
+_WEB_PREVIEW_SUBDIR = "web-preview"
+
+
+def _cache_web_preview(content: bytes, settings: Settings) -> str | None:
+    """Persist a verified web candidate's pixels locally so the UI loads them
+    from our static mount instead of the raw (often hotlink-protected /
+    rate-limited) Yandex/Bing CDN URL. Returns the local /uploads/... path."""
+    try:
+        d = Path(settings.uploads_dir) / _WEB_PREVIEW_SUBDIR
+        d.mkdir(parents=True, exist_ok=True)
+        name = hashlib.sha1(content).hexdigest() + ".jpg"
+        p = d / name
+        if not p.exists():
+            p.write_bytes(content)
+        return f"/uploads/{_WEB_PREVIEW_SUBDIR}/{name}"
+    except Exception:  # noqa: BLE001 — preview caching is best-effort
+        return ""
+from app.models import MATCH_FAMILY_RANK, ImageMeta, SearchResult
 from app.repo import Repository
 
 
@@ -38,6 +58,8 @@ class Matcher:
     def __init__(self, repo: Repository, settings: Settings):
         self.repo = repo
         self.settings = settings
+        self.clip = None  # optional Clipper, injected late (avoids import cycle)
+        self.face = None  # optional FaceId, injected late
         self._histogram_cache: dict[int, np.ndarray] = {}
         self._cache_loaded = False
 
@@ -55,13 +77,118 @@ class Matcher:
         self._cache_loaded = False
         self._histogram_cache = {}
 
-    def search_local(self, query_features: dict, mode: str, limit: int) -> list[SearchResult]:
+    def search_local(
+        self,
+        query_features: dict,
+        mode: str,
+        limit: int,
+        query_clip: list[float] | None = None,
+    ) -> list[SearchResult]:
         # Small index -> exact scan (guaranteed recall, still fast).
         # Large index -> ANN via VSEARCH (sub-ms Hamming search).
         index_size = self.repo.image_count()
         if index_size <= self.settings.exact_scan_max_images:
-            return self._exact_scan(query_features, mode, limit)
-        return self._ann_search(query_features, mode, limit)
+            results = self._exact_scan(query_features, mode, limit)
+        else:
+            results = self._ann_search(query_features, mode, limit)
+        return self._semantic_gate(results, query_clip, mode)
+
+    def _semantic_gate(self, results: list[SearchResult], query_clip: list[float] | None, mode: str) -> list[SearchResult]:
+        """Drop hash matches whose CONTENT disagrees (CLIP below the verify
+        floor): flat logos, dark frames and textures can hash close to
+        anything. Same rule as web verification. Skipped for the deliberate
+        "changed"/"color" modes and for rows without a stored embedding."""
+        floor = self.settings.clip_verify_min_sim
+        if not query_clip or floor <= 0 or mode in ("changed", "color") or self.clip is None:
+            return results
+        kept: list[SearchResult] = []
+        for r in results:
+            if r.clip_embedding:
+                sim = self.clip.match(query_clip, r.clip_embedding)
+                if sim < floor:
+                    continue
+                r.clip_sim = round(sim, 4)
+                r.ai_modalities = sorted(set(r.ai_modalities or []) | {"hash", "clip"})
+            else:
+                r.ai_modalities = sorted(set(r.ai_modalities or []) | {"hash"})
+            kept.append(r)
+        return kept
+
+    def search_local_geometric(
+        self,
+        query_img,
+        query_clip: list[float] | None,
+        exclude: set[int],
+        limit: int = 20,
+    ) -> list[SearchResult]:
+        """TinEye-style crops/edits inside the OWN index: hashes miss a
+        cropped or bordered copy, keypoints don't. Candidates are the top
+        ``limit`` entries by CLIP similarity above the geometry prefilter
+        (an unrelated picture cannot be a crop), checked with SIFT + RANSAC
+        against the best local pixels (original upload, else thumbnail)."""
+        from app import geometry
+        from app.indexer import local_pixels
+
+        st = self.settings
+        if not st.geometric_verify_enabled or query_img is None or not query_clip or self.clip is None:
+            return []
+        scored = []
+        for meta in self.repo.all_images():
+            if meta.id in exclude or not meta.clip_embedding:
+                continue
+            sim = self.clip.match(query_clip, meta.clip_embedding)
+            if sim >= st.geometric_clip_prefilter:
+                scored.append((sim, meta))
+        if not scored:
+            return []
+        scored.sort(key=lambda t: -t[0])
+        q_kp = geometry.Keypoints.from_image(query_img)
+        q_kp_mirror = geometry.Keypoints.from_image(geometry.mirror(query_img))
+        out: list[SearchResult] = []
+        for sim, meta in scored[:limit]:
+            img = local_pixels(st, meta)
+            if img is None:
+                continue
+            gm = geometry.verify(q_kp, q_kp_mirror, img)
+            if gm is None:
+                continue
+            strong = gm.inliers >= st.geometric_strong_inliers and gm.ratio >= 0.3
+            medium = (
+                gm.inliers >= st.geometric_min_inliers
+                and gm.ratio >= st.geometric_min_inlier_ratio
+                and sim >= st.clip_verify_min_sim
+            )
+            if not (strong or medium):
+                continue
+            strength = min(1.0, gm.inliers / 150.0)
+            mods = ["geometry", "clip"] + (["mirrored"] if gm.mirrored else [])
+            out.append(SearchResult(
+                image_id=meta.id,
+                url=meta.url,
+                page_url=meta.page_url,
+                title=meta.title or meta.url,
+                engine=meta.engine,
+                source="local",
+                match_type="modified",
+                score=round(0.6 + 0.25 * strength, 4),
+                confidence=int(round(70 + 27 * strength)),
+                category="duplicate",
+                width=meta.width,
+                height=meta.height,
+                thumb=f"/img/{meta.id}.{meta.thumb_ext}",
+                first_seen=meta.first_seen,
+                last_seen=meta.last_seen,
+                source_count=meta.source_count,
+                source_urls=list(meta.source_urls or []),
+                caption=meta.caption or "",
+                content_phash=meta.phash,
+                clip_sim=round(sim, 4),
+                geo_inliers=gm.inliers,
+                ai_modalities=mods,
+                note="cropped / edited copy of your image" + ("; mirrored" if gm.mirrored else ""),
+                clip_embedding=list(meta.clip_embedding or []),
+            ))
+        return out
 
     def _ann_search(self, query_features: dict, mode: str, limit: int) -> list[SearchResult]:
         phash = int(query_features.get("phash", 0))
@@ -109,6 +236,8 @@ class Matcher:
                 continue  # only strong near-duplicates for these modes
             if mode == "changed" and not (fused_exact < fused <= 0.5):
                 continue  # the "most changed" band: beyond exact, still related
+            mtype = self._match_type(fused)
+            conf, cat = self._conf_and_category(fused, mtype)
             results.append(
                 SearchResult(
                     image_id=meta.id,
@@ -118,15 +247,20 @@ class Matcher:
                     engine=meta.engine,
                     source="local",
                     hamming=dp,
-                    match_type=self._match_type(fused),
+                    content_phash=meta.phash,
+                    match_type=mtype,
                     score=round(1.0 - fused, 4),
                     width=meta.width,
                     height=meta.height,
                     thumb=f"/img/{meta.id}.{meta.thumb_ext}",
+                    confidence=conf,
+                    category=cat,
                     first_seen=meta.first_seen,
                     last_seen=meta.last_seen,
                     source_count=meta.source_count,
                     source_urls=list(meta.source_urls or []),
+                    caption=meta.caption or "",
+                    clip_embedding=list(meta.clip_embedding or []),
                 )
             )
         # post-rerank: boost exact matches, bigger images, fresher results
@@ -146,6 +280,30 @@ class Matcher:
         if fused <= self.settings.fused_near_threshold:
             return "near"
         return "changed"
+
+    @staticmethod
+    def _conf_and_category(
+        fused: float,
+        match_type: str,
+    ) -> tuple[int, str]:
+        """FaceCheck-style confidence + Reversely-style bucket from fused distance.
+
+        fused 0 (identical) -> confidence 100, category "duplicate".
+        fused <= near      -> a real near-duplicate copy ("duplicate").
+        fused <= changed   -> a genuinely similar variant/crop ("similar").
+        beyond             -> not confirmed cleanly ("similar"/"candidate").
+        Percent drops with distance so the grid sorts by how close each is.
+        """
+        conf = int(round(max(0.0, min(1.0, 1.0 - fused)) * 100))
+        if match_type == "exact":
+            cat = "duplicate"
+        elif match_type == "near":
+            cat = "duplicate"
+        elif match_type == "changed":
+            cat = "similar"
+        else:
+            cat = "candidate"
+        return conf, cat
 
     @staticmethod
     def _fused_distance(query_features: dict, meta: ImageMeta) -> tuple[float, int, int, int]:
@@ -192,10 +350,26 @@ class Matcher:
         hits: list,
         limit: int = 24,
         budget_seconds: float | None = None,
+        query_clip: list[float] | None = None,
+        query_img=None,
+        query_faces: list[list[float]] | None = None,
     ) -> list[SearchResult]:
-        """Download every web candidate and judge it with OUR hashes — the
-        TinEye model. Engines only find URLs; this method decides which ones
-        actually contain the query image.
+        """Download every web candidate and judge it ourselves — the TinEye
+        model. Engines only find URLs; this method decides which ones
+        actually contain the query image (or the query person).
+
+        Verdict ladder per candidate (first that holds wins):
+
+        1. **hash** — fused pHash/dHash/aHash (also against the MIRRORED
+           query) within the near threshold, and CLIP agrees it is the same
+           content -> ``exact`` / ``near``;
+        2. **geometry** — SIFT + RANSAC finds the query inside the candidate
+           (crop, border, caption bar, rotation, flip) -> ``modified``;
+        3. **face** — the candidate shows the same person as the query
+           (ArcFace) -> ``face`` (FaceCheck: a different photo of you);
+        4. **clip** — semantically close -> ``similar`` (Google-Lens style
+           lead, never counted as found);
+        5. otherwise ``unverified`` with the honest reason.
 
         Each candidate is fetched (through the proxify tunnel when configured),
         feature-extracted, and its fused pHash/dHash/aHash distance to the
@@ -213,7 +387,7 @@ class Matcher:
         candidates are reported ``unverified`` (timeout) so the response stays
         real-time and never blocks on stragglers.
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 
         import html as html_mod
 
@@ -222,7 +396,27 @@ class Matcher:
         from app.models import ImageHit
         from app.searx import DEFAULT_UA
 
-        candidates = list(hits)[: min(limit, self.settings.web_verify_max_candidates)]
+        # Bare CDN image copies have NO article page — the engine only found the
+        # raw pixels (preview.redd.it/...png, i.imgur.com/...png). Such a URL is
+        # not a removable site nor an openable article; clicking "open post"
+        # just re-opens the image. Drop them before spending verify budget on a
+        # fetch (they can never produce a usable page_url anyway).
+        def _is_bare_image_url(u: str) -> bool:
+            try:
+                path = urlparse(u).path.lower()
+            except ValueError:
+                path = ""
+            return path.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".bmp"))
+
+        def _has_article_page(hit: ImageHit) -> bool:
+            page = (hit.url or "").strip()
+            if not page:
+                return False
+            if _is_bare_image_url(page):
+                return False
+            return True
+
+        candidates = [h for h in hits if _has_article_page(h)][: min(limit, self.settings.web_verify_max_candidates)]
         if not candidates:
             return []
         proxy = self.settings.fetch_proxy_url or None
@@ -386,7 +580,28 @@ class Matcher:
                     return None, url, hops + ["render-failed"]
             return None, url, hops + ["not-an-image"]
 
+        # ---- query-side profile, computed once for every candidate --------
+        from app import geometry
+        from app.features import extract_features as _xf
+        from PIL import ImageOps
+
+        clip = self.clip if (self.clip is not None and self.clip.available) else None
+        face = self.face if (self.face is not None and self.face.available and query_faces) else None
+        flip_features: dict | None = None
+        q_kp = q_kp_mirror = None
+        if query_img is not None:
+            try:
+                flip_features = _xf(ImageOps.mirror(query_img))
+            except Exception:  # noqa: BLE001
+                flip_features = None
+            if self.settings.geometric_verify_enabled:
+                q_kp = geometry.Keypoints.from_image(query_img)
+                q_kp_mirror = geometry.Keypoints.from_image(geometry.mirror(query_img))
+        st = self.settings
+        clip_floor = st.clip_verify_min_sim
+
         def verify_one(hit: ImageHit) -> SearchResult:
+            hops: list[str] = []
             try:
                 content, resolved_url, hops = fetch_bytes(hit.img_src, referer=hit.url or hit.img_src)
                 if not content:
@@ -397,67 +612,180 @@ class Matcher:
                 if min(img.size) < min_dim:
                     return self._unverified(hit, note=f"too small ({img.size[0]}x{img.size[1]})", resolution=hops)
                 feats = extract_features(img, content)
-                fused, dp, _, _ = self._fused_from_hashes(
-                    query_features,
-                    int(feats["phash"]),
-                    int(feats["dhash"]),
-                    int(feats["ahash"]),
-                )
+                cand_hashes = (int(feats["phash"]), int(feats["dhash"]), int(feats["ahash"]))
+                fused, dp, _, _ = self._fused_from_hashes(query_features, *cand_hashes)
+                mirrored = False
+                if flip_features is not None:
+                    ffused, fdp, _, _ = self._fused_from_hashes(flip_features, *cand_hashes)
+                    if ffused < fused:
+                        fused, dp, mirrored = ffused, fdp, True
+                # CLIP: semantic closeness. Gates hash matches (two different
+                # logos can hash close), prefilters geometry, and powers the
+                # "visually similar" section. The candidate embedding also
+                # rides along so consolidation can merge re-encoded copies.
+                cand_clip: list[float] | None = clip.embed_image(img) if clip else None
+                clip_sim = clip.match(query_clip, cand_clip) if (clip and query_clip and cand_clip) else None
+                # pixels decode fine — keep a LOCAL preview so the thumbnail
+                # renders whatever the verdict (raw Yandex/Bing CDN URLs are
+                # hotlink-protected / rate-limited).
+                preview = _cache_web_preview(content, self.settings)
+
+                mtype = ""
+                modalities: list[str] = []
+                note = ""
+                conf = 0
+                cat = ""
+                score = 0.0
+                geo_inliers: int | None = None
+                face_sim: float | None = None
+                face_tier = ""
+                clip_note = ""
+
+                # 1. hash (+ semantic agreement)
+                if fused <= fused_near:
+                    if clip_sim is not None and clip_floor > 0 and clip_sim < clip_floor:
+                        clip_note = f"semantic mismatch (clip {clip_sim:.2f} < {clip_floor:.2f})"
+                    else:
+                        mtype = self._match_type(fused)
+                        conf, cat = self._conf_and_category(fused, mtype)
+                        score = 1.0 - fused
+                        modalities = ["hash"]
+
+                # 2. geometry: crop / border / overlay / rotation / flip
+                if not mtype and q_kp is not None and (
+                    clip_sim is None or clip_sim >= st.geometric_clip_prefilter
+                ):
+                    gm = geometry.verify(q_kp, q_kp_mirror, img)
+                    if gm is not None:
+                        strong = gm.inliers >= st.geometric_strong_inliers and gm.ratio >= 0.3
+                        medium = (
+                            gm.inliers >= st.geometric_min_inliers
+                            and gm.ratio >= st.geometric_min_inlier_ratio
+                            and clip_sim is not None
+                            and clip_sim >= clip_floor
+                        )
+                        if strong or medium:
+                            mtype = "modified"
+                            geo_inliers = gm.inliers
+                            mirrored = mirrored or gm.mirrored
+                            strength = min(1.0, gm.inliers / 150.0)
+                            conf = int(round(70 + 27 * strength))
+                            cat = "duplicate"
+                            score = 0.6 + 0.25 * strength
+                            modalities = ["geometry"]
+                            note = "cropped / edited copy of your image"
+
+                # 3. face: same person, possibly a completely different photo
+                if face is not None:
+                    cand_faces = [f["embedding"] for f in face.embed_image(img)]
+                    if cand_faces:
+                        face_sim = face.best_match(query_faces, cand_faces)
+                        if face.is_same_person(face_sim):
+                            _fconf, face_tier = face.confidence_tier(face_sim)
+                            modalities.append("face")
+                            if not mtype:
+                                mtype = "face"
+                                conf = _fconf
+                                cat = "face-" + face_tier
+                                score = face_sim
+                                note = "same person, different photo"
+
+                # 4. CLIP: visually similar lead (never counted as found)
+                if not mtype and not clip_note and clip_sim is not None and clip_sim >= st.clip_similar_min_sim:
+                    mtype = "similar"
+                    cat = "similar"
+                    conf = int(round(clip_sim * 100))
+                    score = 0.3 * clip_sim
+                    modalities = ["clip"]
+                if clip_sim is not None and "clip" not in modalities and mtype:
+                    modalities.append("clip")
+                if mirrored and mtype in ("exact", "near", "modified"):
+                    modalities.append("mirrored")
+                    note = (note + "; " if note else "") + "mirrored"
             except Exception:  # noqa: BLE001 — a bad candidate must never fail the search
                 return self._unverified(hit, note="verification error", resolution=hops)
-            if fused > fused_near:
+
+            if not mtype:
                 return self._unverified(
-                    hit, hamming=dp, fused=fused, note=f"hash mismatch Δ{dp}", resolution=hops
+                    hit,
+                    hamming=dp,
+                    fused=fused,
+                    note=clip_note or f"no match (hash Δ{dp}"
+                    + (f", clip {clip_sim:.2f}" if clip_sim is not None else "")
+                    + (f", face {face_sim:.2f}" if face_sim is not None else "")
+                    + ")",
+                    resolution=hops,
+                    thumb=preview,
+                    clip_sim=clip_sim,
                 )
             # resolved_url is the URL the verified pixels actually came from —
             # for FB that is the FRESH render-discovered signed URL (the engine
             # candidate may already be expired -> "Bad URL hash"). The page
             # link stays the stable human reference.
             final_url = resolved_url or hit.img_src
-            note = ""
             if "fbcdn.net" in (urlparse(final_url).hostname or ""):
-                note = "Facebook signed CDN links expire in minutes — use the page link for the stable source."
+                note = (note + " — " if note else "") + (
+                    "Facebook signed CDN links expire in minutes — use the page link for the stable source."
+                )
+            # The ORIGINAL WEBSITE (hit.url) is the "found on" source that
+            # matters — CDN copies are transient and useless for takedowns.
+            source_urls = [hit.url] if hit.url and hit.url != final_url else [final_url]
             return SearchResult(
                 url=final_url,
                 page_url=hit.url,
                 title=hit.title or final_url,
                 engine=hit.engine,
                 source="web",
-                match_type=self._match_type(fused),
-                score=round(1.0 - fused, 4),
+                match_type=mtype,
+                score=round(score, 4),
                 hamming=dp,
+                content_phash=int(feats["phash"]),
                 width=feats["width"],
                 height=feats["height"],
+                thumb=preview,
+                source_urls=source_urls,
+                confidence=conf,
+                category=cat,
                 last_seen=time.time(),
                 first_seen=time.time(),
                 resolution=hops,
                 note=note,
+                ai_modalities=modalities,
+                face_sim=round(face_sim, 4) if face_sim is not None else None,
+                face_tier=face_tier,
+                clip_sim=round(clip_sim, 4) if clip_sim is not None else None,
+                geo_inliers=geo_inliers,
+                clip_embedding=cand_clip or [],
             )
 
-        deadline = None
-        if budget_seconds is not None:
-            deadline = time.monotonic() + budget_seconds
-
+        # Bounded by the budget for real: the pool is shut down WITHOUT
+        # waiting when time runs out (a `with` block would block on every
+        # straggler, silently breaking the real-time budget).
+        deadline = time.monotonic() + budget_seconds if budget_seconds is not None else None
         results: list[SearchResult] = []
-        pending_hits = list(candidates)
-        with ThreadPoolExecutor(max_workers=self.settings.web_verify_concurrency) as pool:
-            futures = [pool.submit(verify_one, h) for h in candidates]
-            for fut in as_completed(futures):
+        pool = ThreadPoolExecutor(max_workers=max(1, self.settings.web_verify_concurrency))
+        futures = {pool.submit(verify_one, h): h for h in candidates}
+        finished: set[int] = set()
+        try:
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            for fut in as_completed(futures, timeout=remaining):
+                hit = futures[fut]
+                finished.add(id(hit))
                 try:
                     results.append(fut.result())
                 except Exception:  # noqa: BLE001
-                    continue
-                if deadline is not None and time.monotonic() >= deadline:
-                    break
-        # anything still unverified when the budget ran out is reported as a
+                    results.append(self._unverified(hit, note="verification error"))
+        except TimeoutError:
+            pass
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        # anything not finished within the budget is reported as a
         # timeout-unverified candidate — never silently dropped, never a match
-        if deadline is not None and len(results) < len(candidates):
-            done = {r.url for r in results}
-            for hit in pending_hits:
-                if hit.img_src not in done:
-                    results.append(self._unverified(hit, note="verification budget exceeded", resolution=["budget-timeout"]))
-        # verified matches first (highest score), unverified last
-        results.sort(key=lambda r: (0 if r.match_type != "unverified" else 1, -r.score))
+        for hit in candidates:
+            if id(hit) not in finished:
+                results.append(self._unverified(hit, note="verification budget exceeded", resolution=["budget-timeout"]))
+        # confirmed first, then leads, then unverified; best score within
+        results.sort(key=lambda r: (MATCH_FAMILY_RANK.get(r.match_type, 3), -r.score))
         return results
 
     @staticmethod
@@ -467,11 +795,16 @@ class Matcher:
         fused: float | None = None,
         note: str = "",
         resolution: list[str] | None = None,
+        thumb: str = "",
+        clip_sim: float | None = None,
     ) -> SearchResult:
         """A candidate that could not be fetched or did not hash-match.
         Score stays LOW regardless of how close it seemed, so an unverified
         row can never look like a strong confirmed match. ``note`` is the
-        honest reason shown in the UI (fetch 403 / hash mismatch / ...)."""
+        honest reason shown in the UI (fetch 403 / hash mismatch / ...).
+        ``thumb`` is a locally-cached preview when the image WAS fetched but
+        didn't hash-match — the thumbnail still renders in the UI even though
+        it is not a confirmed copy."""
         return SearchResult(
             url=hit.img_src,
             page_url=hit.url,
@@ -481,10 +814,17 @@ class Matcher:
             match_type="unverified",
             score=round(max(0.0, 1.0 - (fused or 1.0)) * 0.2, 4) if hamming is not None else 0.05,
             hamming=hamming,
+            # unverified candidates are always the weakest bucket; if we got
+            # pixels (thumb) it's visually-similar "candidate", else just noise.
+            confidence=0,
+            category="candidate" if thumb else "candidate",
             last_seen=time.time(),
             first_seen=time.time(),
             resolution=resolution or [],
             note=note,
+            thumb=thumb,
+            source_urls=[hit.url] if hit.url and hit.url != hit.img_src else [],
+            clip_sim=round(clip_sim, 4) if clip_sim is not None else None,
         )
 
     def search_color(self, query_features: dict, limit: int) -> list[SearchResult]:
@@ -503,6 +843,9 @@ class Matcher:
             meta = self.repo.get_image(int(ids[idx]))
             if not meta:
                 continue
+            dist = float(dists[idx])
+            conf = int(round(max(0.0, min(1.0, 1.0 - dist)) * 100))
+            cat = "duplicate" if dist <= 0.08 else "similar"
             out.append(
                 SearchResult(
                     image_id=meta.id,
@@ -511,11 +854,13 @@ class Matcher:
                     title=meta.title or meta.url,
                     engine=meta.engine,
                     source="local",
-                    score=max(0.0, 1.0 - float(dists[idx])),
+                    score=max(0.0, 1.0 - dist),
                     match_type="color",
                     width=meta.width,
                     height=meta.height,
                     thumb=f"/img/{meta.id}.{meta.thumb_ext}",
+                    confidence=conf,
+                    category=cat,
                     first_seen=meta.first_seen,
                     last_seen=meta.last_seen,
                     source_count=meta.source_count,
@@ -549,7 +894,9 @@ def fuse_results(local: list[SearchResult], web: list[SearchResult], k: int = 60
     web_rank = {id(r): i for i, r in enumerate(web)}
     fused: list[SearchResult] = []
     for group in buckets.values():
-        best = min(group, key=lambda r: 0 if r.source == "local" else 1)
+        # the strongest verdict wins (an exact web copy beats a local
+        # "similar" row of the same URL); among equals the indexed copy wins
+        best = min(group, key=lambda r: (MATCH_FAMILY_RANK.get(r.match_type, 3), 0 if r.source == "local" else 1))
         rrf = 0.0
         for r in group:
             if id(r) in local_rank:
@@ -568,19 +915,140 @@ def fuse_results(local: list[SearchResult], web: list[SearchResult], k: int = 60
             source="both" if any(r.source == "local" for r in group) and any(r.source == "web" for r in group) else best.source,
             score=best.score + rrf * 0.5,
             hamming=best.hamming,
+            content_phash=best.content_phash,
             # verified web results carry their real match type (exact/near) —
             # the old blind "web" label no longer exists anywhere
             match_type=best.match_type,
             width=best.width,
             height=best.height,
             thumb=best.thumb,
+            confidence=best.confidence,
+            category=best.category,
             first_seen=best.first_seen,
             last_seen=best.last_seen,
             source_count=best.source_count,
             resolution=best.resolution,
             note=best.note,
+            caption=best.caption or "",
+            source_urls=list(best.source_urls or []),
+            ai_modalities=sorted({m for r in group for m in (r.ai_modalities or [])}),
+            face_sim=best.face_sim,
+            face_tier=best.face_tier,
+            clip_sim=best.clip_sim,
+            geo_inliers=best.geo_inliers,
+            clip_embedding=list(best.clip_embedding or []),
         )
         fused.append(merged)
 
-    fused.sort(key=lambda r: (-r.score, r.hamming if r.hamming is not None else 99))
+    fused.sort(key=lambda r: (MATCH_FAMILY_RANK.get(r.match_type, 3), -r.score, r.hamming if r.hamming is not None else 99))
     return fused
+
+
+def _phash_hamming(a: int | None, b: int | None) -> int | None:
+    """Hamming distance between two content pHashes, None if either is missing."""
+    if a is None or b is None:
+        return None
+    return (a ^ b).bit_count()
+
+
+def consolidate_duplicates(
+    results: list[SearchResult],
+    threshold: int = 8,
+    clip=None,
+    clip_threshold: float = 0.90,
+) -> list[SearchResult]:
+    """Collapse results that are the SAME underlying photo into one card.
+
+    Each result now carries ``content_phash`` — the perceptual hash of the
+    bytes that were actually verified/downloaded. Multiple engines often return
+    several URLs of the same photo (Logo on the company site, the same logo on
+    a product page, the logo on a news article...). Without consolidation the
+    grid floods with near-identical tiles of one image.
+
+    This groups results whose content pHashes are within ``threshold`` Hamming
+    bits (= same photo, possibly re-encoded / differently sized / watermarked
+    copies) into a single representative whose ``source_count`` and
+    ``source_urls`` carry every site the photo was found on — TinEye's
+    "found on N sites". Results with no phash (unverified / noise) match no
+    group and stay as-is.
+
+    When ``clip`` (a Clipper) is live and ``clip_threshold`` > 0, a pair whose
+    pHashes diverge BEYOND ``threshold`` bits (heavy re-encode / resize) can
+    still be merged if their CLIP embeddings are semantically the same content
+    (>= ``clip_threshold``) — this fixes the "same coffee photo, one exact one
+    75%" symptom where hash-only merge left two tiles of the identical image
+    with different confidences.
+
+    Unverified candidates are never consolidated into a verified group.
+    """
+    if not results:
+        return results
+    unverified = [r for r in results if r.match_type == "unverified"]
+    verified = [r for r in results if r.match_type != "unverified"]
+
+    clip_live = bool(clip is not None and getattr(clip, "available", False) and clip_threshold > 0)
+
+    def family(x: SearchResult) -> int:
+        return MATCH_FAMILY_RANK.get(x.match_type, 3)
+
+    groups: list[SearchResult] = []
+    for r in verified:
+        placed = False
+        for g in groups:
+            # never fold a lead (similar/ocr) or another photo of the person
+            # into a confirmed-copy card, or vice versa
+            if family(g) != family(r):
+                continue
+            d = _phash_hamming(g.content_phash, r.content_phash)
+            if d is not None and d <= threshold:
+                _merge_duplicate(g, r)
+                placed = True
+                break
+            # CLIP rescue: same semantic content, hash drifted past the band.
+            if (
+                clip_live
+                and d is not None
+                and d > threshold
+                and g.clip_embedding
+                and r.clip_embedding
+            ):
+                if clip.match(g.clip_embedding, r.clip_embedding) >= clip_threshold:
+                    _merge_duplicate(g, r)
+                    placed = True
+                    break
+        if not placed:
+            # seed the group with its OWN first url only when it has no
+            # accumulated verified link list yet (fresh web group). Local
+            # index copies already carry the canonical count/link list from
+            # the repo — do not inflate it with the canonical URL again.
+            if not r.source_urls:
+                r.source_urls = [r.page_url or r.url]
+                r.source_count = 1
+            groups.append(r)
+
+    groups.sort(key=lambda r: (family(r), -r.score, r.hamming if r.hamming is not None else 99))
+    return groups + unverified
+
+
+def _merge_duplicate(group: SearchResult, r: SearchResult) -> None:
+    """Fuse r into group: better score wins, source URLs accumulate, engine set."""
+    if r.score > group.score or (r.match_type == "exact" and group.match_type != "exact"):
+        group.score = r.score
+        group.match_type = r.match_type
+        group.url = r.url
+        group.image_id = r.image_id or group.image_id
+        group.confidence = max(group.confidence, r.confidence)
+    group.ai_modalities = sorted(set(group.ai_modalities or []) | set(r.ai_modalities or []))
+    engines = {group.engine, r.engine}
+    engines.discard("")
+    group.engine = ",".join(sorted(engines)) or group.engine
+    src_set = set(group.source_urls or []) | set(r.source_urls or [])
+    # The ORIGINAL WEBSITE (page_url) is the primary "found on" link — CDN
+    # copies (url) are transient/hotlink-protected and useless for takedowns.
+    if r.page_url:
+        src_set.add(r.page_url)
+    if r.url and not r.url.startswith("data:"):
+        src_set.add(r.url)
+    group.source_urls = sorted(s for s in src_set if s)
+    group.source_count = max(group.source_count or 1, len(group.source_urls) or 1)
+    group.page_url = group.page_url or r.page_url

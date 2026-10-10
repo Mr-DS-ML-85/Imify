@@ -77,6 +77,13 @@ services:
       DATA_DIR: /data
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-60}
+      # Optional self-hosted AI (Ollama) + OCR layers
+      AI_OLLAMA_URL: ${AI_OLLAMA_URL:-}
+      AI_CAPTION_MODEL: ${AI_CAPTION_MODEL:-llama3.2-vision}
+      AI_EMBED_MODEL: ${AI_EMBED_MODEL:-nomic-embed-text}
+      AI_CAPTION_ON_INDEX: ${AI_CAPTION_ON_INDEX:-false}
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_LANG: ${OCR_LANG:-eng}
     volumes:
       - imify-data:/data
     ports:
@@ -107,6 +114,12 @@ services:
       DATA_DIR: /data
       INDEXER_FETCH_WORKERS: ${INDEXER_FETCH_WORKERS:-4}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Optional self-hosted AI (Ollama) + OCR layers
+      AI_OLLAMA_URL: ${AI_OLLAMA_URL:-}
+      AI_CAPTION_MODEL: ${AI_CAPTION_MODEL:-llama3.2-vision}
+      AI_CAPTION_ON_INDEX: ${AI_CAPTION_ON_INDEX:-false}
+      OCR_ENABLED: ${OCR_ENABLED:-false}
+      OCR_LANG: ${OCR_LANG:-eng}
     volumes:
       - imify-data:/data
     depends_on:

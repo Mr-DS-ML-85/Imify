@@ -125,6 +125,8 @@ class FakeYandex:
 @pytest.fixture
 def settings(tmp_path):
     return Settings(
+        _env_file=None,
+        uploads_dir=str(tmp_path / "data" / "uploads"),
         storage_backend="sqlite",
         sqlite_path=str(tmp_path / "test.db"),
         data_dir=str(tmp_path / "data"),

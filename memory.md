@@ -5,9 +5,44 @@
 > for the exact in-flight debugging state (resume here)**, `docs/ARCHITECTURE.md` for design, and
 > `README.md` for product docs. Update this file after every significant change.
 
-**Last updated**: 2026-08-05 (session: FB logo / YouTuber accuracy / similar-results work)
-**Project root**: `/run/media/irfan/models1/imify`
-**Stack**: Python 3.13 (uv) · FastAPI · StrikeDB (user's own DB, port 6008) · SearXNG (8080) · Proxify (8081 API / 8888 tunnel) · vanilla JS UI
+**Last updated**: 2026-10-10 (accuracy overhaul — see §0). Previous: 2026-08-06 (CPU-only policy enforced: NO CUDA/GPU anywhere; AI/face/CLIP merged into /v1/search grid; models2 is NOT live)
+**Project root**: `/run/media/irfan/models/imify` (moved here by 2026-10-10; older notes below say `models1`/`models2` — both are GONE. `.env` no longer hard-codes absolute model/cookie paths; defaults resolve from the project root). Previously: `/run/media/irfan/models1/imify` — **THE LIVE ONE** (confirmed by user, who is non-root; `models2/imify` is a root-owned dir with only deploy/reference and is NOT the project — do NOT edit/use it). Old notes saying models2 is live are WRONG.
+**Stack**: Python 3.13 (uv) · FastAPI · StrikeDB (user's own DB, port 6008) · SearXNG (8080) · Proxify (8081 API / 8888 tunnel) · vanilla JS UI · OpenCV FaceDetectorYN+ArcFace · CLIP (ONNX int8) · Real-ESRGAN/BiRefNet (enhance) — **ALL models CPU-only (plain `onnxruntime`, DNN_TARGET_CPU); CUDA/onnxruntime-gpu is banned** (a GPU crash once killed the user's nvidia driver, requiring a reinstall)
+
+---
+
+## 0. 2026-10-10 SESSION — ACCURACY OVERHAUL (read first)
+
+**Root-cause bugs fixed (all measured on this box's own data):**
+- **Face-ID was effectively random.** `cv2.FaceRecognizerSF.alignCrop` wants the FULL 15-value YuNet row
+  (landmarks at offset 4) but got only the 10 keypoints → misaligned crops; `feature()` also fed raw
+  0-255 pixels (SFace preprocessing) into ArcFace. Different people scored median 0.74 (max 0.91),
+  ABOVE true matches. Now: similarity-transform alignment onto the ArcFace template + `(x-127.5)/127.5`
+  RGB via onnxruntime → same person ≥ 0.88, different people ≤ 0.30 (median 0.01).
+  `face_id_same_threshold` 0.50→**0.42**. Embeddings carry `ImageMeta.face_model` = `FaceId.MODEL_TAG`;
+  old ones are ignored and re-embedded by the indexer's new **`ai-backfill` thread** (uses the original
+  upload when present, else the thumbnail). YuNet `top_k` was being passed `min_face_size` (48) → now 5000;
+  min size + score floor enforced; YuNet calls are locked (not thread-safe).
+- **`match_identity` mutual-NN dropped every photo of a person after the first** (copies' runner-up was each other). Now threshold-only, best face per image. `face_id_match_margin` removed.
+- **AI grid never returned anything**: `_local_ai_grid` passed `ai_modalities`/`face_sim`/... to `SearchResult`, which lacked those fields → TypeError swallowed by `except: pass`. Fields added.
+- **Verification budget was not enforced**: budget `break` inside `with ThreadPoolExecutor` still waited for every straggler (both `verify_web_hits` and `_byte_upload_all`). Now `shutdown(wait=False, cancel_futures=True)`.
+- CLIP grid floor was 0.32 (CLIP puts unrelated photos at ~0.50). Calibrated: copies ≥ 0.90, unrelated median 0.50 / p90 0.66.
+- CSP lacked `blob:` → uploaded query preview never rendered. Tests read the live `.env` (now `_env_file=None` + tmp uploads dir).
+- 3 Clipper + 2 FaceId instances were loaded → one shared instance each (`main.py`).
+
+**New verdict ladder** (`Matcher.verify_web_hits`, also local): 1) hash incl. MIRRORED query + CLIP
+agreement (`clip_verify_min_sim` 0.80) → exact/near; 2) **SIFT+RANSAC geometry** (`app/geometry.py`) →
+`modified` (crops/borders/overlays/rotation; ≥40 inliers alone, 18-39 needs CLIP ≥ 0.80 — real copies
+measured 58-330, unrelated ≤ ~30); 3) **face** → `face` (same person, other photo); 4) CLIP ≥ 0.78 →
+`similar` (lead, NOT found). `models.CONFIRMED_MATCH_TYPES` decides `found`; `MATCH_FAMILY_RANK` orders
+copies → face → similar → unverified. Local search got the same CLIP gate + `search_local_geometric`.
+**Face-crop upload**: when the main face is <20% of the frame, a crop is also sent to Yandex
+(`yandex-face` task, `face_crop_upload`). UI groups results into "Copies / Same person / Visually
+similar / Unconfirmed" sections with evidence chips. Tests: 134 passing (`tests/test_accuracy.py` new).
+
+**Live stack state found 2026-10-10:** `imify.service` crash-loops (unit still points at
+`/run/media/irfan/models2/imify`); StrikeDB :6008 and proxify :8081/:8888 were NOT running; SearXNG up.
+Not touched — needs the user's go-ahead (fix the unit's paths to `/run/media/irfan/models/imify`).
 
 ---
 
@@ -68,7 +103,13 @@ Imify = **independent reverse image search** (TinEye / Google Lens / Circle-to-S
   **The search ladder lives here** (§5).
 - `app/matcher.py` — fused pHash+dHash+aHash matching (the "TinEye judge"), `verify_web_hits`
   downloads candidates and hash-verifies them, `fuse_results` merges local+web, `_unverified`.
-- `app/repo.py` — repository over Storage protocol; image meta, dedup maps, pending queue,
+  `verify_web_hits(..., query_clip)` takes the CLIP gate hook (NOT yet wired at the fused gate).
+- `app/face.py` — OpenCV 5.0 `FaceDetectorYN` (YuNet) + `FaceRecognizerSF` (ArcFace 512-dim).
+  **CPU-only**: `target = cv2.dnn.DNN_TARGET_CPU` always; the CUDA branch was removed (config `device` is accepted but ignored). `provider` reports "CPU".
+- `app/clip.py` — CLIP vision encoder (ONNX int8, 224 BICUBIC, L2-normalized 512-dim), lazy + auto-download,
+  `match()` cosine, `same_threshold=0.80`. CPU-only (onnxruntime no GPU EP; opencv no CUDA build).
+- `app/models.py` — `ImageMeta.clip_embedding` (512-dim list) + `ImageMeta.face_embedding` (512-dim).
+- `app/repo.py` — repository over Electron; images, dedup maps, pending queue,
   trackers, **web-results cache** (`get_web_results`/`set_web_results`, TTL stored in entry), stats.
 - `app/indexer.py` — background crawl/ingest workers + **tracker loop** (re-search tracked images).
 - `app/engines/__init__.py` — `run_reverse_chain` (parallel providers within budget).
@@ -145,36 +186,45 @@ docker restart proxy-orchestrator && sleep 12
 ```bash
 cd /run/media/irfan/models1/imify
 
-# StrikeDB (if not up)
-redis-cli -p 6008 PING || scripts/start_stack.sh   # start_stack.sh also starts app
+# StrikeDB — CRITICAL: cwd MUST be project root OR pass env. A bare `dbstrike.wal`@root is the
+# stale 2KB file; REAL data is `data/dbstrike.wal` (2.0MB). The binary links libnvrtc.so.12
+# (CUDA 12 lib) which the box's CUDA 13.1 does NOT provide in ldconfig — export LD_LIBRARY_PATH
+# to the ASC venv copy of it, else dbstrike exits "cannot open shared object file". Correct launch:
+export LD_LIBRARY_PATH=/run/media/irfan/models1/ASC/asc-venv/lib/python3.11/site-packages/nvidia/cuda_nvrtc/lib:$LD_LIBRARY_PATH
+DBSTRIKE_WAL=data/dbstrike.wal setsid nohup reference/StrikeDB/target/release/dbstrike 127.0.0.1:6008 >> data/dbstrike.log 2>&1 &
+redis-cli -p 6008 PING
 
-# App — MUST use systemd (plain nohup dies with the shell in this environment):
-systemctl --user restart imify.service
-systemctl --user status imify.service
+# App — NO pkill; kill per-PID (pgrep -f), then:
+setsid nohup .venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8010 >> data/app-8010.log 2>&1 &
 curl -s http://127.0.0.1:8010/health/live
+curl -s http://127.0.0.1:8010/v1/stats   # face: enabled/CPU, clip: enabled/CPU, storage strikedb
 
 # Proxify health
 curl -s http://127.0.0.1:8081/health
 
-# Tests (116)
-uv run pytest
-# JS
-node --check app/static/app.js
-
-# Live e2e (upload → search)
-uv run python -c "
-import httpx
-raw = open('/tmp/yandex_image_proxy.jpg','rb').read()
-r = httpx.post('http://127.0.0.1:8010/v1/search', files={'file':('q.jpg',raw,'image/jpeg')}, data={'include_web':'true'}, timeout=200)
-d = r.json(); print('found:',d['found'],'results:',len(d['results']),'degraded:',d['degraded'])
-"
+# Tests — CAREFUL: `uv run pytest`/onnx import triggers the local GPU stack; the CPU-only
+# venv now lists ONLY [CPUExecutionProvider]. Do NOT run model-loading tests on a fresh driver
+# until the box is confirmed stable.
+.venv/bin/python -m pytest tests/ 2>&1 | tail -3; echo "EXIT=$?"
 ```
+
+**CPU-only policy (2026-08-06)**: `onnxruntime-gpu` was replaced with plain `onnxruntime` (venv now
+reports `['AzureExecutionProvider','CPUExecutionProvider']` — no CUDA). `clip.py` and `enhance.py`
+pass `providers=["CPUExecutionProvider"]`; `face.py` forces `DNN_TARGET_CPU`. A GPU/driver crash
+earlier took the user's nvidia driver down entirely (needed reinstall) — NEVER re-add CUDA. The
+`.env` `FACE_ID_MODELS_DIR`/`CLIP_MODELS_DIR` were pointing at root-owned `models2/imify/data` →
+fixed to `models1/imify/data/models/{face,clip}` (models already on disk there).
+
+**AI layers merged into /v1/search** (2026-08-06): `_local_ai_grid()` in `app/api.py` merges local
+face/CLIP/OCR matches into the SAME main search grid (provider "ai") instead of only separate
+endpoints — a blurry face or text logo now surfaces in the default search. Returns `SearchResult`
+objects, dedupes against hash hits, sorted by score, capped.
 
 **systemd unit** `~/.config/systemd/user/imify.service`:
 ```
 [Service]
 Type=simple
-ExecStart=/bin/bash -c 'cd /run/media/irfan/models1/imify && exec uv run uvicorn app.main:app --host 127.0.0.1 --port 8010'
+ExecStart=/bin/bash -c 'cd /run/media/irfan/models1/imify && exec .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8010'
 WorkingDirectory=/run/media/irfan/models1/imify
 Restart=always
 RestartSec=5
@@ -183,7 +233,7 @@ StandardError=append:/run/media/irfan/models1/imify/data/app-8010.log
 [Install]
 WantedBy=default.target
 ```
-App logs: `data/app-8010.log`. NOTE: this environment kills backgrounded processes when the spawning shell exits — always use systemd or `setsid nohup ... & disown`.
+App logs: `data/app-8010.log`.
 
 ---
 
@@ -200,38 +250,71 @@ App logs: `data/app-8010.log`. NOTE: this environment kills backgrounded process
 9. **proxify patches** — see §4 (route await, r.text await, wait_selector, re-capture content).
 10. **Systemd service** — app survives shell exit (see §6).
 11. **Bing upload gate in api.py** now includes yandex (`or settings.yandex_upload_enabled`); yandex tried first.
+12. **CLIP layer built & LIVE** (`app/clip.py`): CLIP_ENABLED=true in `.env`, 512-dim L2 embeddings persisted on `ImageMeta`, `/v1/search/clip` + `/v1/admin/clip/backfill` + stats.clip. CPU ONNX int8. Live: images_embedded 3.
+13. **Face-ID pipeline** (`app/face.py`): OpenCV YuNet+ArcFace 512-dim works; `/v1/search/face` (60% match on Elon portrait); `/v1/admin/face/backfill` (thumb-reuse, limaued — raw bytes never persisted for web entries); honest `provider` (CUDA only when `cv2.cuda` has devices).
+14. **StrikeDB namespace layer**: `vadd_ns`/`vsearch_ns` (VADDNS/VSEARCHNS) in storage + StrikeDB `resp.py`; rebuilt after `git pull` (StrikeDB @3b6cbd4). **Reality: HNSW graph on :6008 is 64-dim (phash) → VSEARCHNS with a 512-dim vector returns `[]`. Namespaces only partition; one graph = one dimension.**
+15. **Enhancement models downloaded/verified**: `data/models/enhance/realesrgan_x4.onnx` (fp16 33.7MB), `birefnet_lite.onnx` (114.5MB); CLIP `data/models/clip/vision_model_int8.onnx` (88.6MB). No `app/enhance.py` yet.
+16. **Admin UI backfill button**: `app/static/admin.html`+`admin.js` — Face-ID index panel (provider chip, coverage, Backfill button). `admin.js?v=4`.
+17. **CPU-only enforced** (this session): `onnxruntime-gpu`→`onnxruntime`; `face.py` `DNN_TARGET_CPU` always (CUDA branch removed); `clip.py`/`enhance.py` already CPU. venv reports `[AzureExecutionProvider, CPUExecutionProvider]` only. NEVER re-add CUDA (crashed user's driver once).
+18. **`.env` model dirs fixed**: `FACE_ID_MODELS_DIR`/`CLIP_MODELS_DIR` pointed at root-owned `models2/imify/data` → now `models1/imify/data/models/{face,clip}` (was the PermissionError root cause). `FACE_ID_DEVICE=cpu`.
+19. **`_local_ai_grid` merged into `/v1/search`** (`app/api.py` ~113): face/CLIP/OCR local matches now feed the MAIN grid ("ai" provider), not just `/v1/search/face|clip`. 
+20. **Face false-positive fix (this session, root cause MEASURED)**: on ACTUAL data, different-people ArcFace similarity median ≈ **0.49**, but the grid gate was `0.40 × 0.8 = 0.32` → admitted ~half the index as "matches" (your "suite photo matches wrong people"). FIX: `face.py` new `match_identity()` with **mutual nearest-neighbour + margin** (`face_id_same_threshold=0.50`, `face_id_match_margin=0.05`); both call sites (`/v1/search/face` + `_local_ai_grid`) use it. Confidence tiers now map the real 0.5-0.9 same-person band to Certain/Confident/Uncertain/Weak (not linear 0-100).
+21. **Face detection miss fix (holiday photo)**: `face_id_min_face_size` 96→**48**, new `detect_faces_multiscale()` (scales 1.0/0.7/1.4 + center-dedup) so small/distant holiday faces get caught.
+22. **CDN-drop filter (`app/matcher.py`)**: web candidates whose `hit.url` is only a bare image/CDN file (preview.redd.it, i.imgur.com, content.timeweb.com — no real article page) are dropped BEFORE verify budget; fixes "Open post/article just opens the image".
+23. **AI-grid kwarg bug FIXED**: `_local_ai_grid` `_wrap()` passed `ai_modality="clip"/"ocr"` but `SearchResult` field is `ai_modalities` (list) → TypeError swallowed by `except:pass` → the "ai" grid silently NEVER returned anything. Now `ai_modalities=["clip"]/["ocr"]/["face"]` (api.py 191/212/171).
+24. **"36 images match ANY prompt" text-search bug FIXED**: `/v1/search/text` had NO similarity floor + re-embedded every caption per query. Now: `ai_text_min_sim=0.50` config floor (nomic-embed baseline makes 0.35 pass everything — 0.50 keeps only close captions), and caption embeddings are PERSISTED at index time (`ImageMeta.caption_embedding`, indexer) so search is a cosine over stored vectors, never 37 remote embed calls. `/v1/search/fulltext` matched caption boilerplate ("image/with/a/the/shows/depicts" in ALL 36) → now stopword-filtered + `min_hits = max(1, ceil(len(tokens)/2))`. VERIFIED: "man"→10, "kitten"→1, "image"/"the"→400.
+25. **No-thumb / can't-open text results FIXED**: `/v1/search/text|ocr|fulltext` returned raw `meta.to_dict()` (no `thumb`, url=`file:///...models2/...` stale decoy path) → UI img fell back to dead file://. Now shaped with `thumb=/img/{id}.{ext}`, `page_url`, `category`, and `confidence=%` (was 0% everywhere). VERIFIED: text "suit microphone" → 88% top, kitten 69%, all with thumbs.
+26. **Vision model upgraded 11B→90B**: `.env` + config `AI_CAPTION_MODEL=meta/llama-3.2-90b-vision-instruct` (NVIDIA NIM) — 11B hallucinated colors/identity (called blue-red logo wrong, mixed "hacker profile" caption with Elon). Existing captions stay old (id=1 caption says "red circle on blue" which is actually roughly right: blue bg 1872px + red circle 635px). Re-captioning old entries = future task.
+27. **Remote-link-replaced-by-local-link bug FIXED (THE BIG ONE)**: ALL 36 entries had `url='file:///run/media/irfan/models2/imify/data/uploads/...'` (root-owned DECOY path, non-existent for user) because the user-upload path enqueued the LOOPBACK url (`http://127.0.0.1:8010/uploads/<name>`) as the canonical index entry; the real remote URL only landed in `source_urls`. After one verified search, every later search returned the dead local link. FIXED at 3 layers: (a) `indexer.py _is_remote_url()` + `_merge_duplicate` promotes remote URL→canonical over file:///127.0.0.1; (b) `repo.py add_source_link` promotes remote url/page_url over local; (c) `api.py _maybe_track_upload` now enqueues the VERIFIED REMOTE url (not loopback) when the web layer confirmed the upload on a real site. VERIFIED: id=37 canonical = `https://www.canyon-news.com/...Yos.jpg`.
+28. **UnboundLocalError `query_clip` FIXED**: `query_clip` was annotated inside the `query_bytes` branch but referenced on the `image_id` path → 500 "cannot access local variable". Moved init to function top (`query_clip: list[float] | None = None`). VERIFIED: image_id+web search returns 200.
 
 ---
 
-## 8. OPEN ISSUES / CURRENT WORK (see docs/PROBLEMS.md + docs/HANDOFF.md for detail)
+## 8. OPEN ISSUES / CURRENT WORK (THE TWO REAL PROBLEMS)
 
-**The big one the user is hitting right now** (FULL detail in docs/HANDOFF.md):
-- A YouTuber-face upload returned **24 results from Bing only** — all junk (animals/girls/objects, the person is male). Yandex/SearXNG/Google contributed nothing.
-- FB-logo upload → "Engines checked the whole internet but found nothing: yandex-upload, google-upload" (Bing degraded with 400) — impossible for the most-indexed image on earth → **hidden bug suspected**.
-- Patches APPLIED but NOT yet live-verified (this is where the next session starts):
-  1. **Yandex `wait_selector` matched the EMPTY shell** (`.SerpList` exists on empty pages) → returned 0 hits before results rendered. FIXED in `app/engines/yandex_images.py` to `.serp-item, .CbirSites, .ImagesContentSearchItem, [class*="serp-item"]`. 🟡
-  2. **Google upload used `use_browser: False`** → 0.3s shell. FIXED in `app/engines/google_images.py` to browser (gui_chrome) + `wait_selector` for Lens results. 🟡
-  3. **Bing returns junk candidates** — verification marks them unverified (correct), but the user wants accurate SIMILAR results too; Bing 400s intermittently (rate-limit?). 🔴
-  4. **SearXNG is NOT in the byte-upload path** — only URL-based chain. No public URL on this box → searxng never contributes. 🔴 (see PROBLEMS.md P4 for options)
-  5. **Yandex "No matching results" for a YouTuber face is suspicious** — hypothesis: byte-upload needs a follow-up GET with `cbir_id` after the POST registers (see HANDOFF step 1). 🔴
+**Problem A — AI features run SEPARATE from reverse search (user's core complaint).**
+Face-ID and CLIP exist as their own endpoints (`/v1/search/face`, `/v1/search/clip`) but do NOT feed
+the main `/v1/search` grid. Symptom the user reported LIVE: uploaded a **blurry influencer photo** →
+engine saw "similar people" separately but the main search said it **"matches with sea", only 2 results**.
+More chaos (all confirmed on LIVE homelab pics): a **homelab photo** was returned as **"near" matches with
+a black dog and a swimming pool**; another **homelab photo returned a single result today — a "girl with a moon"**
+presented as unverified; unrelated/unverified candidates keep leaking into the grid as if they matter.
+So /v1/search only sees pHash/dHash/aHash closeness → semantically unrelated junk becomes "near".
 
-**Other tracked issues**:
-- `source_urls` are plain strings in image meta (`add_source_link`) — UI handles strings; earlier debug script assumed dicts (that was a debug script bug, not app bug).
-- Index has only 2 images (id 1 FB pic, id 2 Elon webp) — most uploads are not indexed (by design: only verified/learn). Consider a "similar from local index" fallback using relaxed thresholds so the fast local DB always has something to show.
-- Google face results are limited by Google (user fact) — Yandex is the face path.
-- Bing browser-POST returns 404 shell for some images (don't trust it as verdict — fall through to tunnel/direct).
-- **TEST STATE**: 116 passing (google + yandex tests updated for browser-first contract).
+**The REAL hash-close false-positive fixed by a CLIP semantic gate** (repro + confirmed bug):
+`curl POST /v1/search` with Rajshahi-University-logo upload → total 2, providers [local, web], **2 wrong
+hash-only "near" matches**: Noakhali Science & Technology logo (sim 0.674) + Bijay Ekattar Hall logo
+(sim 0.660). Two different university logos judged "near" purely on hashes — no content check.
+`app/matcher.py:464` fused>fused_near path does NOT consult CLIP yet.
 
----
+**FIX (in progress)**: wire CLIP gate into verification ("Let me wire the CLIP semantic gate"). Add a
+config floor (e.g. `clip_verify_min_sim` ≈0.55); in `verify_web_hits`, when `query_clip` is available and
+a candidate has a CLIP embedding, a candidate whose CLIP sim is below the floor is downgraded to
+`_unverified(note="semantic mismatch")` — kills Rajshahi/Noakhali/Bijay and homelab→dog/pool nonsense.
+
+**THE B key - unrelated unverified candidates leak into the grid as "matches".** CDN "person with iPhone"
+result surfaced as a match; two different student logos hash-close → "near". Root cause: verification is
+hash-only. Same CLIP gate + a `clip_verify` pass (#2) addresses it.
+
+**THE namespace dimension block for AI ANN (#3)**: VSEARCHNS(512-dim) → `[]` because :6008 graph is 64-dim.
+Options: brute-force metadata match (already works for faces, no ANN needed) OR start a 2nd dbstrike (:6009)
+whose WAL was seeded to hold 512-dim vectors. User prefers brute-force-style fix "regardless of namespace".
+
+**Enhancement (#4)** — user asked: also add "blurry image clear" via
+**BiRefNet** (ZhengPeng7/BiRefNet) + **Real-ESRGAN** (xinntao/Real-ESRGAN). Models downloaded to
+`data/models/enhance/` (realesrgan_x4, birefnet_lite) and verified to load+run in onnxruntime, but no
+`app/enhance.py`. Plan: blur-detection (Laplacian var) → Real-ESRGAN x4 upscale → BiRefNet foreground
+refine → feed CLEARED image to feature extraction + web upload.
 
 ## 9. NEXT STEPS (suggested order)
 
-1. **Live-verify Yandex fixed wait** on the YouTuber upload (should return real avatars.mds thumbnails + source pages). If still "No matching results", inspect `/tmp/yandex_yt.html` — check CbirIntent-Thumb present (upload registered) vs empty shell.
-2. **Live-verify Google browser upload** — check for `"ou"` JSON or imgres links in returned HTML.
-3. **Fix Bing 400** — investigate intermittent 400 (try `curl_cffi` persona / different Referer / retry); ensure junk candidates stay `unverified` and verified matches rank first.
-4. **Route SearXNG into byte-upload path** for similar images (or document why it can't without a public URL).
-5. **Local relaxed-similar fallback** in matcher (wider fused threshold → "similar" from own index) so the grid is never empty.
-6. Re-run `uv run pytest` (116) + live e2e; update this file + docs/PROBLEMS.md.
+1. **Wire CLIP semantic gate into `verify_web_hits`** (`app/matcher.py:464`, `app/config.py` floor, pass
+   `query_clip` from `app/api.py` search handler) → kills Raj/shahi/Noakhali/BStorm + sea/dog/pool false
+   "near". Tests + live repro re-run.
+2. **Feed face+CLIP local matches INTO `/v1/search` grid** (not just separate endpoints) so a blurred
+   influencer is found by the AI layers even before content verification (#A). Brute-force, no ANN.
+3. **`app/enhance.py`** — blur detect → Real-ESRGAN → BiRefNet refine → use enhanced image for extraction + web.
+4. Live-verify all together on the user's three repros; update PROBLEMS.md + HANDOFF.md; re-run pytest (127).
 
 ---
 
@@ -246,3 +329,17 @@ App logs: `data/app-8010.log`. NOTE: this environment kills backgrounded process
 - **"We don't believe in pass or fail"** — need success-rate metrics and honest per-hops logging (resolution hops shown in UI).
 - User wants **similar AND exact** images in real time; failed searches must NOT index the failed image.
 - User prefers hash-based matching (own matcher) over text detection / facial-recognition services.
+- **Live Project root = `models1/imify`** (the ONLY real project; user is non-root). `models2/imify`
+  is a root-owned dir (deploy/reference only) — treat it as NOT the project; don't edit/use it.
+  Old notes saying models2 is live are the exact bug that crashed the model dirs.
+- **NEVER run anything that initializes a CUDA/GPU session** — `onnxruntime-gpu`, `dnn.DNN_TARGET_CUDA`,
+  or model-loading pytest on a fresh driver. It once crashed the user's nvidia driver requiring a
+  reinstall. Stack is CPU-only by policy (plain `onnxruntime`).
+- **NEVER `pkill`** the app or dbstrike — kill only by exact PID found via `pgrep -f`.
+- **dbstrike WAL**: real data is `data/dbstrike.wal` (2.0MB); a bare `dbstrike.wal`@root is stale 2KB.
+  Launch with `DBSTRIKE_WAL=data/dbstrike.wal`. Backup exists at `data/dbstrike.wal.bak`.
+  Binary needs `libnvrtc.so.12` via LD_LIBRARY_PATH to the ASC venv (see §6).
+- **Models dir**: `/run/media/irfan/models1/imify/data/models/{clip,face,enhance}` (CLIP, Face-ID, Real-ESRGAN, BiRefNet) — all already downloaded; all CPU.
+- **AI service split**: nomic text embeddings live on the OTHER server (192.168.0.107:8374, llama.cpp);
+  vision/captioning is cloud NVIDIA NIM; OCR = local tesseract; CLIP+face+enhance = local CPU ONNX.
+- **Enhancement requested**: clear blurry uploads via BiRefNet (ZhengPeng7) + Real-ESRGAN (xinntao) — implemented in `app/enhance.py`, wired into /v1/search.

@@ -59,107 +59,223 @@ class YandexImagesReverse:
         return bool(self.proxify_fetch_url or self.fetch_proxy_url)
 
     # ------------------------------------------------------------- upload
-    # Modern Yandex (2026) is JS-gated: a plain HTTP POST (``simple``) returns
-    # a shell whose results only exist after JS executes. The browser POST
-    # (gui_chrome, carrying the session cookies) registers the upload and the
-    # rendered DOM carries the results — so the browser route is tried FIRST.
+    # Modern Yandex (2026) is a TWO-STEP flow, not a single POST:
+    #   1. register the raw bytes via POST images-apphost/image-download →
+    #      a JSON response whose "url" encodes the cbir_id (the raw bytes are
+    #      already in memory — no intermediate download needed).
+    #   2. GET /images/search?cbir_id=<id>&rpt=imageview&cbir_page=sites →
+    #      the real results page (HTML with .serp-item / cbir-page JSON).
+    # A single POST to /images/search returns an empty shell (cbirId="",
+    # "No matching results.") even for the most-indexed image — proven. So the
+    # browser route (gui_chrome carrying session cookies) does both steps.
     def search_upload(self, image_bytes: bytes, filename: str = "image.jpg") -> list[ImageHit]:
         """Byte-upload reverse search (circle-to-search style, no public URL
-        needed). Stage 1: proxify /fetch browser POST (gui_chrome + wait for
-        the results container to render) — the proven path. Stage 2: proxify
-        CONNECT tunnel -> direct as fallbacks."""
+        needed). Uses the true TWO-STEP flow: POST image-download (register the
+        raw bytes, read the cbir_id) then GET the /images/search?cbir_id= URL.
+
+        Carrier order (live-proven 2026): the bridge 2-step upload (POST
+        image-download -> GET /images/search?cbir_id=) via the proxify CONNECT
+        tunnel and direct both work and are fast; the /fetch browser path is the
+        last resort. Only the first route that yields a real results page wins."""
         errors: list[str] = []
-        # The browser route's rendered page is the authoritative verdict (it
-        # can honestly say "no matching results") — only fall through on real
-        # errors (blocked/timeouts), never on an empty-but-rendered page.
-        if self.proxify_fetch_url:
-            try:
-                page = self._upload_via_fetch(image_bytes, filename)
-                return self._finish(page, "proxify-fetch-browser")
-            except EngineError as exc:
-                errors.append(f"proxify-fetch: {exc}")
         if self.fetch_proxy_url:
             try:
                 page = self._upload_proxy(image_bytes, filename, proxy=self.fetch_proxy_url)
-                return self._finish(page, "proxify-tunnel")
+                hits = self._finish(page, "proxify-tunnel")
+                if hits:
+                    return hits
             except EngineError as exc:
                 errors.append(f"proxify: {exc}")
         try:
             page = self._upload_proxy(image_bytes, filename, proxy=None)
-            return self._finish(page, "direct")
+            hits = self._finish(page, "direct")
+            if hits:
+                return hits
         except EngineError as exc:
             errors.append(f"direct: {exc}")
+        if self.proxify_fetch_url:
+            try:
+                page = self._upload_via_fetch(image_bytes, filename)
+                hits = self._finish(page, "proxify-fetch-browser")
+                if hits:
+                    return hits
+            except EngineError as exc:
+                errors.append(f"proxify-fetch: {exc}")
         raise EngineError("yandex-upload failed via all paths: " + "; ".join(errors))
 
+    # ------------------------------------------------------------------ 2-step
+    def _image_download_url(self) -> str:
+        # Endpoint the real front-end uses to register a byte-upload.
+        return (
+            "https://yandex.com/images-apphost/image-download"
+            "?cbird=37&images_avatars_size=preview&images_avatars_namespace=images-cbir"
+        )
+
+    def _cbir_id_from_upload(self, page: str) -> str:
+        """Extract cbir_id from the image-download JSON response. Live shape
+        (2026)::
+
+            {"cbir_id":"4761143/<token>","namespace":"images-cbir",
+             "sizes":{"orig":{"path":"https://avatars.mds.yandex.net/get-images-cbir/4761143/<token>/orig"},
+                      "preview":{"path":"..."}}}
+
+        Also tolerates the older ``{"url":".../get-images-cbir/<id>/preview"}``
+        shape. Returns the cbir_id (or "" if the upload did not register)."""
+        m = re.search(r'"cbir_id"\s*:\s*"([^"]+)"', page)
+        if m:
+            return m.group(1)
+        m = re.search(r'"url"\s*:\s*"([^"]+)"', page)
+        if m:
+            idm = re.search(r"get-images-cbir/([^/\"]+)/", m.group(1))
+            if idm:
+                return idm.group(1)
+        for key in ("cbirId", "requestId", "idimg", "id"):
+            m = re.search(r'"%s"\s*:\s*"([^"]+)"' % key, page)
+            if m:
+                return m.group(1)
+        return ""
+
+    def _orig_url_from_upload(self, page: str, cbir_id: str) -> str:
+        """Extract the orig (full-size) CDN URL of the uploaded image from the
+        image-download response, used as the ``url`` param in the follow-up GET.
+        Falls back to the cbir_id-encoded path."""
+        m = re.search(r'"orig"\s*:\s*\{[^}]*?"path"\s*:\s*"([^"]+)"', page)
+        if m:
+            return m.group(1)
+        return f"https://avatars.mds.yandex.net/get-images-cbir/{cbir_id}/orig"
+
     def _upload_proxy(self, image_bytes: bytes, filename: str, proxy: str | None) -> str:
-        try:
-            resp = httpx.post(
-                SEARCH_URL,
-                data={"rpt": "imageview", "format": "json"},
-                files={"upfile": (filename, image_bytes)},
+        """Plain-HTTP 2-step upload (tunnel/direct): register via
+        image-download, then GET the cbir search page."""
+        cookies = httpx.Cookies()
+
+        def _get_session() -> httpx.Client:
+            return httpx.Client(
                 timeout=45,
                 follow_redirects=True,
                 proxy=proxy,
-                headers={"User-Agent": DESKTOP_UA, "Accept-Language": "en-US,en;q=0.9"},
+                cookies=cookies,
+                headers={
+                    "User-Agent": DESKTOP_UA,
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
             )
-            resp.raise_for_status()
-            if resp.status_code in (403, 429):
-                raise EngineError(f"yandex blocked the upload (status={resp.status_code})")
-            return resp.text
+
+        try:
+            with _get_session() as client:
+                # -- step 1: register the raw bytes (in-memory; no disk download)
+                up = client.post(
+                    self._image_download_url(),
+                    content=image_bytes,
+                    headers={
+                        "Content-Type": "image/jpeg",
+                        "Origin": "https://yandex.com",
+                        "Referer": "https://yandex.com/images/search",
+                        "Accept": "application/json",
+                    },
+                )
+                up.raise_for_status()
+                if up.status_code in (403, 429):
+                    raise EngineError(f"yandex blocked the upload (status={up.status_code})")
+                cbir_id = self._cbir_id_from_upload(up.text)
+                if not cbir_id:
+                    raise EngineError("yandex image-download returned no cbir id")
+                orig_url = self._orig_url_from_upload(up.text, cbir_id)
+                # -- step 2: fetch the results page for that cbir id
+                target = (
+                    f"{SEARCH_URL}?rpt=imageview&url={urllib.parse.quote(orig_url, safe='')}"
+                    f"&cbir_id={urllib.parse.quote(cbir_id)}"
+                    "&cbir_page=sites&family=0&pornowhitelist=1&ipnd=1"
+                )
+                resp = client.get(target)
+                resp.raise_for_status()
+                return resp.text
         except httpx.HTTPError as exc:
             raise EngineError(f"yandex-upload failed (proxy={proxy or 'direct'}): {exc}") from exc
         except Exception as exc:  # noqa: BLE001 — any transport failure degrades
             raise EngineError(f"yandex-upload failed (proxy={proxy or 'direct'}): {exc}") from exc
 
-    def _upload_via_fetch(self, image_bytes: bytes, filename: str) -> str:
-        """Binary upload through proxify /fetch rendered in the REAL browser
-        (gui_chrome — session cookies + TLS persona + JS execution). The page
-        is returned only after the results container (.CbirSites/.SerpList)
-        renders — or after the wait times out ("no matching results" page),
-        which is an honest outcome, not a pipeline failure."""
-        boundary = f"----imify{id(image_bytes):x}"
-        parts = [
-            f"--{boundary}\r\n".encode(),
-            f'Content-Disposition: form-data; name="upfile"; filename="{filename}"\r\n'.encode(),
-            b"Content-Type: application/octet-stream\r\n\r\n",
-            image_bytes,
-            b"\r\n",
-            f"--{boundary}--\r\n".encode(),
-        ]
+    def _fetch_via_proxify(self, url: str, method: str = "GET", body: bytes | None = None,
+                           content_type: str | None = None, strategy: str | None = None,
+                           wait_selector: str | None = None) -> str:
+        """proxify /fetch for the 2-step upload. Step 1 (POST image-download)
+        is a fast JSON exchange — curl_cffi_plus carries it in ~2s. Step 2
+        (GET the results page) is JS-gated — gui_chrome + wait_selector. The
+        same proxify persona (session cookies) applies to both."""
+        payload: dict = {
+            "url": url,
+            "method": method,
+            "timeout": 45,
+            "bypass_cache": True,
+        }
+        if strategy:
+            payload["force_strategy"] = strategy
+            payload["use_browser"] = strategy == "gui_chrome"
+        if wait_selector:
+            payload["wait_selector"] = wait_selector
+        headers = {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://yandex.com/images/search",
+        }
+        if body is not None:
+            payload["body_b64"] = base64.b64encode(body).decode("ascii")
+            if content_type:
+                headers["Content-Type"] = content_type
+                headers["Accept"] = "application/json"
+        payload["headers"] = headers
         try:
-            resp = httpx.post(
-                self.proxify_fetch_url + "/fetch",
-                json={
-                    "url": SEARCH_URL,
-                    "method": "POST",
-                    "body_b64": base64.b64encode(b"".join(parts)).decode("ascii"),
-                    "headers": {
-                        "Content-Type": f"multipart/form-data; boundary={boundary}",
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Referer": "https://yandex.com/",
-                    },
-                    "timeout": 45,
-                    "use_browser": True,
-                    "force_strategy": "gui_chrome",
-                    # Yandex renders results into .serp-item / .CbirSites nodes
-                    # asynchronously after the upload registers. CRITICAL: wait
-                    # for actual RESULT items — the empty-page shell already
-                    # contains .SerpList, so waiting on that returns the empty
-                    # page (0 hits) before results ever render.
-                    "wait_selector": '.serp-item, .CbirSites, .ImagesContentSearchItem, [class*="serp-item"]',
-                    "bypass_cache": True,
-                },
-                timeout=80,
-            )
+            resp = httpx.post(self.proxify_fetch_url + "/fetch", json=payload, timeout=80)
             resp.raise_for_status()
             data = resp.json()
         except httpx.HTTPError as exc:
             raise EngineError(f"proxify /fetch unreachable: {exc}") from exc
         except ValueError as exc:
             raise EngineError(f"proxify returned non-JSON: {exc}") from exc
-        if data.get("success") is False:
-            raise EngineError(f"proxify upload failed: {data.get('error', data.get('status_code', 'unknown'))}")
+        if data.get("success") is False and data.get("status_code") not in (200,):
+            raise EngineError(f"proxify fetch failed: {data.get('error', data.get('status_code', 'unknown'))}")
         return data.get("html") or ""
+
+    def _upload_via_fetch(self, image_bytes: bytes, filename: str) -> str:
+        """Two-step upload through proxify /fetch:
+          1. POST image-download with the raw bytes (already in memory) via the
+             fast curl_cffi persona → cbir_id (this is a JSON exchange).
+          2. GET /images/search?cbir_id=... through gui_chrome — the JS-gated
+             results page carrying .serp-item / cbir-page JSON."""
+        # ----- step 1: register the bytes and read the cbir id
+        up_page = ""
+        try:
+            up_page = self._fetch_via_proxify(
+                self._image_download_url(),
+                method="POST",
+                body=image_bytes,
+                content_type="image/jpeg",
+                strategy="curl_cffi_plus",
+            )
+        except EngineError:
+            up_page = ""
+        cbir_id = self._cbir_id_from_upload(up_page) if up_page else ""
+        if not cbir_id:
+            raise EngineError("yandex image-download returned no cbir id (upload not registered)")
+        orig_url = self._orig_url_from_upload(up_page, cbir_id)
+
+        # ----- step 2: fetch the results page for that cbir id
+        target = (
+            f"{SEARCH_URL}?rpt=imageview&url={urllib.parse.quote(orig_url, safe='')}"
+            f"&cbir_id={urllib.parse.quote(cbir_id)}"
+            "&cbir_page=sites&family=0&pornowhitelist=1&ipnd=1"
+        )
+        try:
+            page = self._fetch_via_proxify(
+                target,
+                method="GET",
+                strategy="gui_chrome",
+                wait_selector=".serp-item, .CbirSites, .ImagesContentSearchItem, [class*=\"serp-item\"]",
+            )
+        except EngineError:
+            page = ""
+        if not page:
+            raise EngineError("yandex cbir results fetch failed")
+        return page
 
     def _finish(self, page: str, via: str) -> list[ImageHit]:
         hits = parse_yandex_results(page)
@@ -293,17 +409,15 @@ def parse_yandex_results(page: str) -> list[ImageHit]:
 
     def add(img: str, page_url: str, title: str = "") -> None:
         img = _decode(img).strip()
+        # Yandex appends organic-tracking params to result URLs — strip them so
+        # dedup and the URL-based matcher see clean, comparable URLs.
+        img = re.sub(r"(?i)[?&]utm_(medium|source|campaign|campaignid|content|term)=[^&]+", "", img).rstrip("?&")
+        page_url = re.sub(r"(?i)[?&]utm_(medium|source|campaign|campaignid|content|term)=[^&]+", "", page_url).rstrip("?&")
         if not img or img.startswith("data:") or img in seen:
             return
         if junk(img):
             return
         if any(bad in img for bad in ("favicon", "yandex.net/")):
-            return
-        # The modern rendered DOM serves thumbnails from avatars.mds.yandex.net.
-        # When the anchor carries a real SOURCE page, the CDN url is the actual
-        # image bytes (perfect for hash verification) — keep it. Only drop bare
-        # Yandex CDN noise when there is no source page context at all.
-        if "avatars.mds.yandex.net" in img and not _decode(page_url).strip():
             return
         seen.add(img)
         hits.append(

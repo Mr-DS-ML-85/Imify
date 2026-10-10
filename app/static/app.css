@@ -144,6 +144,26 @@ a:hover { text-decoration: underline; }
 .learn-toggle:hover { border-color: var(--accent); color: var(--text); }
 .learn-toggle input { accent-color: var(--accent); cursor: pointer; }
 
+/* AI / OCR text search row */
+.text-row { width: min(680px, 92vw); margin: 10px auto 0; display: flex; gap: 10px; align-items: center; }
+.text-mode { display: inline-flex; gap: 4px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 4px; }
+.text-mode .tm { border: none; background: transparent; color: var(--text-dim); font-size: 12.5px; font-weight: 700; padding: 7px 12px; border-radius: calc(var(--radius) - 3px); cursor: pointer; transition: all 0.15s; }
+.text-mode .tm:hover { color: var(--text); }
+.text-mode .tm.active { background: var(--accent-grad); color: #081020; }
+.text-row input {
+  flex: 1; background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 12px 16px; font-size: 14px; outline: none; transition: border-color 0.18s;
+}
+.text-row input:focus { border-color: var(--accent); }
+.text-row input::placeholder { color: var(--text-faint); }
+.text-row button {
+  background: var(--accent-grad); color: #081020; border: none; border-radius: var(--radius);
+  padding: 12px 22px; font-size: 14px; font-weight: 800; cursor: pointer; transition: transform 0.15s, filter 0.15s;
+}
+.text-row button:hover { transform: translateY(-1px); filter: brightness(1.08); }
+.text-row button:active { transform: translateY(0); }
+
 /* ------------------------------------------------------------ results */
 .searching { text-align: center; padding: 70px 20px; color: var(--text-dim); }
 .spinner {
@@ -173,6 +193,24 @@ a:hover { text-decoration: underline; }
 .tab:hover { color: var(--text); }
 .tab.active { background: var(--panel-2); color: var(--text); border-color: var(--border); }
 .tab .count { color: var(--text-faint); margin-left: 5px; font-weight: 600; }
+
+/* reverseimagesearch-style engine tabs + Reversely-style category tabs */
+.engine-tabs, .cat-tabs {
+  display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 28px 0;
+}
+.engine-tabs .cat, .cat-tabs .cat {
+  background: transparent; color: var(--text-dim); border: 1px solid transparent;
+  border-radius: 999px; padding: 5px 12px; font-size: 12px; font-weight: 600;
+  cursor: pointer; transition: all 0.16s;
+}
+.engine-tabs .cat:hover, .cat-tabs .cat:hover { color: var(--text); }
+.engine-tabs .cat.active, .cat-tabs .cat.active {
+  background: var(--panel-2); color: var(--text); border-color: var(--border);
+}
+.engine-tabs .cat small, .cat-tabs .cat small {
+  color: var(--text-faint); margin-left: 5px; font-weight: 600;
+}
+.empty-tab { grid-column: 1 / -1; color: var(--text-faint); text-align: center; padding: 30px; }
 
 /* grid */
 .grid { padding: 26px 28px 60px; display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 18px; }
@@ -205,9 +243,9 @@ a:hover { text-decoration: underline; }
 }
 .card .hover {
   position: absolute; inset: 0; background: linear-gradient(180deg, rgba(6, 9, 20, 0.15), rgba(6, 9, 20, 0.82));
-  opacity: 0; transition: opacity 0.22s; display: flex; align-items: flex-end; padding: 14px; gap: 8px;
+  display: flex; align-items: flex-end; padding: 14px; gap: 8px;
 }
-.card:hover .hover { opacity: 1; }
+.card:hover .hover { background: linear-gradient(180deg, rgba(6, 9, 20, 0.15), rgba(6, 9, 20, 0.9)); }
 .hover .act {
   flex: 1; text-align: center; font-size: 12px; font-weight: 700; padding: 9px 6px;
   border-radius: var(--radius-sm); background: rgba(255, 255, 255, 0.12); color: #fff; cursor: pointer;
@@ -237,6 +275,8 @@ a:hover { text-decoration: underline; }
 }
 .res-line .hop-arrow { color: var(--text-faint); font-size: 10px; }.res-note { font-size: 11px; color: var(--text-dim); line-height: 1.35; padding: 5px 8px; border-radius: 6px; background: rgba(10,14,26,0.5); border: 1px solid var(--border-soft); }
   .res-note.warn { color: #f0b37a; border-color: rgba(240, 179, 122, 0.3); background: rgba(240, 179, 122, 0.06); }
+  /* AI alt-text / description for the card */
+  .caption { font-size: 11px; color: var(--text-dim); line-height: 1.4; padding: 5px 8px; border-radius: 6px; background: rgba(90,120,220,0.06); border: 1px solid rgba(90,120,220,0.18); margin-top: 6px; font-style: italic; }
   /* TinEye "found on N sites" — every verified URL carrying this image */
   .sources-line { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; font-size: 11px; padding: 4px 0 0; }
   .sources-label { color: var(--text-faint); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; }
@@ -347,9 +387,29 @@ input[type="text"]:focus, select:focus { border-color: var(--accent); }
   .grid { padding: 18px 16px 48px; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
   .results-head { padding: 14px 16px; }
   .tabs { margin-left: 0; width: 100%; }
+  .engine-tabs, .cat-tabs { padding: 8px 16px 0; }
   .admin-wrap { padding: 22px 16px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
 }
+
+/* ---- verdict badges + result sections (copies / same person / similar) ---- */
+.badge.modified { background: rgba(56, 225, 200, 0.92); color: #03201b; }
+.badge.face { background: rgba(196, 128, 255, 0.92); color: #170626; }
+.badge.similar, .badge.ocr { background: rgba(255, 194, 75, 0.85); color: #241503; }
+.section-head {
+  grid-column: 1 / -1; display: flex; align-items: baseline; gap: 10px;
+  margin: 14px 2px 2px; padding-bottom: 6px; border-bottom: 1px solid var(--border);
+}
+.section-head:first-child { margin-top: 0; }
+.section-head h3 { margin: 0; font-size: 15px; font-weight: 650; color: var(--text); }
+.section-head .count { font-size: 12px; color: var(--text-faint); }
+.section-head p { margin: 0 0 0 auto; font-size: 12px; color: var(--text-faint); text-align: right; }
+.signals { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.signals span {
+  font-size: 10.5px; padding: 1px 6px; border-radius: 999px;
+  border: 1px solid var(--border); color: var(--text-dim, var(--text-faint));
+}
+@media (max-width: 640px) { .section-head { flex-wrap: wrap; } .section-head p { margin-left: 0; text-align: left; } }

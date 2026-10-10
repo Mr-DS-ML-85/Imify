@@ -1,12 +1,11 @@
-"""Google Images reverse image search (``searchbyimage?image_url=``) — proxify-only.
+"""Google Images reverse image search (``searchbyimage?image_url=``).
 
 Google's legacy reverse-search endpoint accepts a publicly reachable image URL
-via GET and returns a results page. Plain requests are almost always answered
-with Google's ``sorry`` block — so this provider routes **exclusively** through
-your proxify anti-bot gateway (real browser session cookies + pinned Chrome 146
-persona, optionally forcing the GUI-Chrome strategy). When no proxify endpoint
-is configured the provider degrades instead of fetching directly — a direct
-fetch would just get blocked and burn a request.
+via GET and returns a results page. Plain httpx requests get ``sorry``-blocked
+at the TLS level on datacenter IPs — so this provider defaults to **curl_cffi
+chrome146 impersonation** (a cloned real-Chrome ClientHello), optionally routed
+through your proxify anti-bot gateway (CONNECT tunnel or REST /fetch). When
+nothing is configured the provider degrades instead of fetching directly.
 """
 
 from __future__ import annotations
@@ -15,6 +14,7 @@ import base64
 import html as html_mod
 import re
 import urllib.parse
+from typing import Any
 
 import httpx
 
@@ -49,6 +49,28 @@ def _build_multipart(image_bytes: bytes, filename: str, content_type: str) -> tu
     return b"".join(parts), boundary
 
 
+def _impersonating_session(proxy: str | None) -> Any:
+    """Session that mimics a real Chrome 146 TLS fingerprint (curl_cffi).
+
+    Google's anti-bot blocks datacenter IPs on the *TLS* level — httpx's
+    OpenSSL ClientHello is a dead giveaway. curl_cffi clones the real Chrome
+    146 handshake, which is the difference between a SERP and a /sorry page.
+    Falls back to plain httpx if curl_cffi isn't installed (rare).
+    """
+    try:
+        from curl_cffi import requests as cf
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        return cf.Session(
+            impersonate="chrome146",
+            proxies={"https": proxy, "http": proxy} if proxy else None,
+            timeout=40,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class GoogleImagesReverse:
     def __init__(
         self,
@@ -67,49 +89,45 @@ class GoogleImagesReverse:
 
     @property
     def available(self) -> bool:
-        """Google is only reachable through proxify — never direct."""
-        return bool(self.proxify_fetch_url)
+        return bool(self.proxify_fetch_url or self.fetch_proxy_url or self.direct_upload)
 
     def search_upload(
         self,
         image_bytes: bytes,
         filename: str = "image.jpg",
         content_type: str = "image/jpeg",
-        direct_upload: bool = True,
+        direct_upload: bool | None = None,
     ) -> list[ImageHit]:
         """Circle-to-Search: reverse-search by uploading the raw bytes to Google Lens.
 
         The one path that works for images with NO publicly reachable URL.
         Routing, in order:
 
-        1. proxify /fetch (base64 body) — full strategy pipeline: pinned Chrome
-           persona, your real session cookies, TLS impersonation;
-        2. proxify CONNECT tunnel — raw bytes;
-        3. direct — only when no proxify is configured (works from residential
-           IPs; Google sorry-blocks datacenter IPs — degraded honestly).
+        1. curl_cffi chrome146 impersonation — via the proxify CONNECT tunnel
+           when configured, else direct. This is the path that beats Google's
+           TLS-level datacenter block (a real chrome146 ClientHello is the
+           difference between a SERP and a /sorry page);
+        2. proxify /fetch (base64 body) — full strategy pipeline: pinned
+           Chrome persona, your real session cookies, browser render;
+        3. direct httpx — only when impersonation is unavailable.
 
         Returns parsed visual-similar results from the Lens /search?udm=26 page.
         """
         body, boundary = _build_multipart(image_bytes, filename, content_type)
         errors: list[str] = []
+        direct = self.direct_upload if direct_upload is None else direct_upload
+        if self.fetch_proxy_url or (direct and _impersonating_session(None) is not None):
+            try:
+                page = self._upload_via_tunnel(body, boundary, proxy=self.fetch_proxy_url or None)
+                return self._finish_upload(page, len(image_bytes), via="impersonated-tunnel" if self.fetch_proxy_url else "impersonated-direct")
+            except EngineError as exc:
+                errors.append(f"impersonation: {exc}")
         if self.proxify_fetch_url:
             try:
                 page = self._upload_via_fetch(body, boundary)
                 return self._finish_upload(page, len(image_bytes), via="proxify")
             except EngineError as exc:
                 errors.append(f"proxify: {exc}")
-        if self.fetch_proxy_url:
-            try:
-                page = self._upload_via_tunnel(body, boundary, proxy=self.fetch_proxy_url)
-                return self._finish_upload(page, len(image_bytes), via="tunnel")
-            except EngineError as exc:
-                errors.append(f"tunnel: {exc}")
-        if direct_upload:
-            try:
-                page = self._upload_via_tunnel(body, boundary, proxy=None)
-                return self._finish_upload(page, len(image_bytes), via="direct")
-            except EngineError as exc:
-                errors.append(f"direct: {exc}")
         raise EngineError("google-upload failed via all paths: " + "; ".join(errors))
 
     def _finish_upload(self, page: str, size: int, via: str) -> list[ImageHit]:
@@ -159,25 +177,33 @@ class GoogleImagesReverse:
 
     def _upload_via_tunnel(self, body: bytes, boundary: str, proxy: str | None) -> str:
         """Raw binary upload through the proxify CONNECT tunnel (or direct)."""
+        sess = _impersonating_session(proxy)
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": DESKTOP_UA,
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://www.google.com/",
+        }
         try:
-            resp = httpx.post(
-                UPLOAD_URL,
-                content=body,
-                timeout=60,
-                follow_redirects=True,
-                proxy=proxy,
-                headers={
-                    "Content-Type": f"multipart/form-data; boundary={boundary}",
-                    "User-Agent": DESKTOP_UA,
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Referer": "https://www.google.com/",
-                },
-            )
-            resp.raise_for_status()
-            if resp.status_code in (403, 429) or (getattr(resp, "url", None) and "sorry" in str(resp.url)):
-                raise EngineError(f"google blocked the upload (status={resp.status_code})")
-            return resp.text
-        except httpx.HTTPError as exc:
+            if sess is not None:
+                resp = sess.post(UPLOAD_URL, data=body, headers=headers, allow_redirects=True)
+            else:
+                resp = httpx.post(
+                    UPLOAD_URL,
+                    content=body,
+                    timeout=60,
+                    follow_redirects=True,
+                    proxy=proxy,
+                    headers=headers,
+                )
+            status = int(getattr(resp, "status_code", 0) or 0)
+            final_url = str(getattr(resp, "url", ""))
+            if status in (403, 429) or "sorry" in final_url:
+                raise EngineError(f"google blocked the upload (status={status})")
+            return str(getattr(resp, "text", "") or "")
+        except EngineError:
+            raise
+        except Exception as exc:  # noqa: BLE001
             raise EngineError(f"google-upload failed (proxy={proxy or 'direct'}): {exc}") from exc
 
     def search(self, image_url: str) -> list[ImageHit]:
@@ -194,29 +220,47 @@ class GoogleImagesReverse:
         return hits
 
     def _fetch(self, target: str) -> str:
-        if not self.proxify_fetch_url:
-            # The user's rule: never hit Google directly — it blocks datacenter
-            # IPs. Degrade (reported as provider:google) instead of a doomed request.
-            raise EngineError(
-                "google provider requires PROXIFY_FETCH_URL (direct fetches get blocked by Google)"
-            )
-        try:
-            resp = httpx.post(
-                self.proxify_fetch_url + "/fetch",
-                json={"url": target, "timeout": 45, "use_browser": self.use_browser},
-                timeout=70,
-            )
-            resp.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise EngineError(f"proxify unreachable: {exc}") from exc
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            # proxify answered 200 with a non-JSON body (error page) — degrade.
-            raise EngineError(f"proxify returned a non-JSON response: {exc}") from exc
-        if data.get("success") is False:
-            raise EngineError(f"proxify fetch failed: {data.get('error', data.get('status_code', 'unknown'))}")
-        return data.get("html") or data.get("markdown") or ""
+        sess = _impersonating_session(None)
+        if self.proxify_fetch_url:
+            payload: dict = {"url": target, "timeout": 45, "use_browser": self.use_browser}
+            # gui_chrome is the strategy that beats Google; /fetch falls back to
+            # curl_cffi_plus when the GUI browser isn't actually up, so forcing
+            # it explicitly (vs bare use_browser=true -> "No strategies
+            # available") always yields a live strategy.
+            if self.use_browser:
+                payload["force_strategy"] = "gui_chrome"
+            try:
+                resp = httpx.post(
+                    self.proxify_fetch_url + "/fetch",
+                    json=payload,
+                    timeout=70,
+                )
+                resp.raise_for_status()
+            except httpx.HTTPError as exc:
+                raise EngineError(f"proxify unreachable: {exc}") from exc
+            try:
+                data = resp.json()
+            except ValueError as exc:
+                # proxify answered 200 with a non-JSON body (error page) — degrade.
+                raise EngineError(f"proxify returned a non-JSON response: {exc}") from exc
+            if data.get("success") is False:
+                raise EngineError(f"proxify fetch failed: {data.get('error', data.get('status_code', 'unknown'))}")
+            return data.get("html") or data.get("markdown") or ""
+        if sess is not None:
+            try:
+                resp = sess.get(target, params={"hl": "en"})
+                status = int(getattr(resp, "status_code", 0) or 0)
+                if status in (403, 429) or "sorry" in str(getattr(resp, "url", "")):
+                    raise EngineError(f"google blocked the fetch (status={status})")
+                return str(getattr(resp, "text", "") or "")
+            except EngineError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise EngineError(f"google fetch failed: {exc}") from exc
+        raise EngineError(
+            "google provider requires curl_cffi or PROXIFY_FETCH_URL "
+            "(direct fetches get blocked by Google)"
+        )
 
 
 def _decode(s: str) -> str:

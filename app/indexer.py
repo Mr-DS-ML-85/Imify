@@ -30,17 +30,38 @@ import httpx
 from PIL import Image
 
 from app.config import Settings
+from app.ai import AiClient
 from app.engines import run_reverse_chain
 from app.engines.bing_images import BingImagesReverse
 from app.engines.google_images import GoogleImagesReverse
 from app.engines.yandex_images import YandexImagesReverse
+from app.clip import Clipper
 from app.features import decode_image, extract_features, hamming
+from app.face import FaceId
 from app.logging import child_logger
+from app.ocr import OcrExtractor
 from app.models import ImageHit, ImageMeta
 from app.repo import Repository
 from app.searx import SearxClient, DEFAULT_UA
 
 Image.MAX_IMAGE_PIXELS = 40_000_000  # decompression-bomb guard
+
+
+def _is_remote_url(url: str) -> bool:
+    """True for a real internet URL (http/https). Local/loopback copies —
+    ``file://`` upload paths and ``http://127.0.0.1:8010/uploads/...`` — are
+    NOT remote; the canonical link must point at the site hosting the image,
+    never at our own storage."""
+    if not url:
+        return False
+    low = url.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        return False
+    host = (url.split("://", 1)[1].split("/", 1)[0] or "").lower()
+    if host in {"127.0.0.1", "localhost"} or host.startswith("127.") or host.startswith("10.") or host.startswith("192.168."):
+        return False
+    return True
+
 
 
 @dataclass
@@ -69,9 +90,16 @@ class Indexer:
         google: GoogleImagesReverse | None = None,
         bing: BingImagesReverse | None = None,
         yandex: YandexImagesReverse | None = None,
+        ai: AiClient | None = None,
+        ocr: OcrExtractor | None = None,
+        face: FaceId | None = None,
+        clip: Clipper | None = None,
     ):
         self.repo = repo
         self.settings = settings
+        self.ocr = ocr or OcrExtractor(enabled=settings.ocr_enabled, lang=settings.ocr_lang)
+        self.face = face or FaceId.from_settings(settings)
+        self.clip = clip or Clipper.from_settings(settings)
         self.searx = searx or SearxClient(
             settings.searxng_url,
             timeout=settings.searxng_timeout_seconds,
@@ -95,6 +123,7 @@ class Indexer:
             proxify_fetch_url=settings.proxify_fetch_url,
             fetch_proxy_url=settings.fetch_proxy_url,
         )
+        self.ai = ai
         self.log = child_logger("imify.indexer", worker="indexer")
         self.status = PipelineStatus()
         self._stop = threading.Event()
@@ -112,6 +141,7 @@ class Indexer:
             threading.Thread(target=self._discovery_loop, name="discovery", daemon=True),
             threading.Thread(target=self._recrawl_loop, name="recrawl", daemon=True),
             threading.Thread(target=self._tracker_loop, name="tracker", daemon=True),
+            threading.Thread(target=self._ai_backfill_loop, name="ai-backfill", daemon=True),
         ]
         for i in range(self.settings.indexer_fetch_workers):
             threads.append(threading.Thread(target=self._worker_loop, name=f"fetch-{i}", daemon=True))
@@ -308,6 +338,64 @@ class Indexer:
             self.repo.register_url(url, image_id)
             self.repo.register_phash(meta.phash, image_id)
             self._save_thumbnail(image_id, img)
+            # Optional AI: caption the newly-indexed image (best-effort, non-
+            # blocking). The caption becomes searchable alt-text and powers
+            # natural-language search. Failures never fail the index write.
+            if (
+                self.settings.ai_caption_on_index
+                and self.ai is not None
+                and self.ai.available
+                and raw
+            ):
+                try:
+                    cap = self.ai.caption(
+                        raw,
+                        mime="image/jpeg",
+                        max_len=240,
+                    )
+                    if cap:
+                        meta.caption = cap
+                        # persist the caption embedding at INDEX time too, so
+                        # by-description search is a cosine over stored vectors
+                        # (never a per-query re-embed of every caption).
+                        try:
+                            if self.ai and self.ai.available:
+                                cvec = self.ai.embed(text=cap)
+                                if cvec:
+                                    meta.caption_embedding = cvec
+                        except Exception:  # noqa: BLE001
+                            pass
+                        self.repo.put_image(meta)
+                except Exception:  # noqa: BLE001
+                    pass
+            # Optional OCR: extract visible text from the newly-indexed image.
+            if self.ocr.available:
+                try:
+                    ocr_text = self.ocr.extract(img)
+                    if ocr_text:
+                        meta.ocr_text = ocr_text
+                        self.repo.put_image(meta)
+                except Exception:  # noqa: BLE001
+                    pass
+            # Optional Face-ID: detect faces + extract identity embeddings.
+            if self.face.available:
+                try:
+                    faces = self.face.embed_image(img)
+                    meta.face_embeddings = [f["embedding"] for f in faces]
+                    meta.face_count = len(faces)
+                    meta.face_model = FaceId.MODEL_TAG
+                    self.repo.put_image(meta)
+                except Exception:  # noqa: BLE001
+                    pass
+            # Optional CLIP: whole-image semantic embedding ("what is this").
+            if self.clip.available:
+                try:
+                    clip_emb = self.clip.embed_image(img)
+                    if clip_emb:
+                        meta.clip_embedding = clip_emb
+                        self.repo.put_image(meta)
+                except Exception:  # noqa: BLE001
+                    pass
             self.repo.incr_stat("indexed")
             self.status.indexed += 1
             self._bump_progress()
@@ -340,6 +428,14 @@ class Indexer:
     def _merge_duplicate(self, meta: ImageMeta, url: str, task: dict) -> None:
         meta.fetch_count += 1
         meta.last_seen = time.time()
+        # A REAL remote source URL (the article/page carrying this image) is
+        # always preferred as the canonical link over a local/loopback copy
+        # (file:// upload path, http://127.0.0.1:8010/uploads/...). Without
+        # this, a user upload indexed via loopback becomes the canonical entry
+        # and the original remote URL only lands in source_urls — so the next
+        # search returns the dead local link instead of the site that hosts it.
+        if _is_remote_url(url) and not _is_remote_url(meta.url):
+            meta.url = url
         if url not in meta.source_urls:
             meta.source_urls.append(url)
             meta.source_count = len(meta.source_urls)
@@ -351,8 +447,74 @@ class Indexer:
         self.repo.register_url(url, meta.id)
         self.log.debug("deduped", extra={"event": "dedup", "image_id": meta.id, "url": url})
 
+    # ------------------------------------------------------- AI backfill
+    def _ai_backfill_loop(self) -> None:
+        """Keep every index entry's face/CLIP embeddings current.
+
+        Entries indexed before a layer was enabled, or embedded by an older
+        (buggy) face pipeline, are re-embedded in small batches in the
+        background — searches never pay for it and never see stale vectors.
+        """
+        self._stop.wait(5)
+        while not self._stop.is_set():
+            try:
+                done = self.backfill_ai(limit=100)
+            except Exception as exc:  # noqa: BLE001 — worker thread must survive
+                self.log.warning("ai backfill failed", extra={"event": "ai_backfill_error", "error": str(exc)})
+                done = {}
+            busy = done.get("faces", 0) + done.get("clip", 0)
+            self._stop.wait(2 if busy else 600)
+
+    def backfill_ai(self, limit: int = 50, force_faces: bool = False) -> dict:
+        """Re-embed up to ``limit`` entries whose face embeddings are missing
+        or from an older pipeline, or whose CLIP embedding is missing."""
+        face_on = self.face.available
+        clip_on = self.clip.available
+        if not (face_on or clip_on):
+            return {"scanned": 0, "faces": 0, "clip": 0}
+        scanned = faces_done = clip_done = 0
+        for meta in self.repo.all_images():
+            if scanned >= limit or self._stop.is_set():
+                break
+            need_face = face_on and (force_faces or meta.face_model != FaceId.MODEL_TAG)
+            need_clip = clip_on and not meta.clip_embedding
+            if not (need_face or need_clip):
+                continue
+            scanned += 1
+            img = local_pixels(self.settings, meta)
+            if img is None:
+                # nothing local to embed from: drop stale vectors so they can
+                # never produce a wrong identity match, and stop retrying
+                if need_face:
+                    meta.face_embeddings = []
+                    meta.face_count = 0
+                    meta.face_model = FaceId.MODEL_TAG
+                    self.repo.put_image(meta)
+                continue
+            if need_face:
+                faces = self.face.embed_image(img)
+                meta.face_embeddings = [f["embedding"] for f in faces]
+                meta.face_count = len(faces)
+                meta.face_model = FaceId.MODEL_TAG
+                faces_done += 1
+            if need_clip:
+                emb = self.clip.embed_image(img)
+                if emb:
+                    meta.clip_embedding = emb
+                    clip_done += 1
+            self.repo.put_image(meta)
+        if faces_done or clip_done:
+            self.log.info("ai backfill", extra={"event": "ai_backfill", "faces": faces_done, "clip": clip_done})
+        return {"scanned": scanned, "faces": faces_done, "clip": clip_done}
+
     # --------------------------------------------------------------- helpers
     def _fetch_image(self, url: str) -> bytes | None:
+        if url.startswith("file://"):
+            try:
+                with open(url[len("file://"):], "rb") as fh:
+                    return fh.read()
+            except OSError:
+                return None
         for attempt in range(self.settings.indexer_max_attempts):
             try:
                 resp = httpx.get(
@@ -551,6 +713,32 @@ class Indexer:
 
     def _set_error(self, message: str) -> None:
         self.status.last_error = message
+
+
+def local_pixels(settings: Settings, meta: ImageMeta) -> Image.Image | None:
+    """Best LOCAL pixels for an index entry, without touching the network:
+    the original upload when we have it (full resolution — matters for small
+    faces), else the stored thumbnail."""
+    from pathlib import Path
+
+    candidates: list[Path] = []
+    url = meta.url or ""
+    if url.startswith("file://"):
+        candidates.append(Path(url[len("file://"):]))
+    if "/uploads/" in url and not _is_remote_url(url):
+        candidates.append(Path(settings.uploads_dir) / url.rsplit("/uploads/", 1)[1])
+    if meta.sha256:
+        candidates.extend(sorted(Path(settings.uploads_dir).glob(f"{meta.sha256}.*")))
+    candidates.append(settings.thumbs_dir / f"{meta.id}.jpg")
+    for path in candidates:
+        try:
+            if path.is_file():
+                img = decode_image(path.read_bytes())
+                if img is not None:
+                    return img
+        except OSError:
+            continue
+    return None
 
 
 def _hash_to_vector(phash: int) -> list[float]:

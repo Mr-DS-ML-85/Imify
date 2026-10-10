@@ -12,10 +12,12 @@ Key namespaces (all under one engine):
 - ``hist:<ts>``          → JSON search history entry
 - ``stat:*`` / ``img:seq`` — counters
 
-Vectors: one 64-dim graph. Each image's pHash is stored as 64 floats of ±1
-via ``VADD`` so ``VSEARCH`` returns Hamming-ordered near-duplicates
-(cosine_dist = hamming/32). Color histograms ride along in the metadata JSON
-and are matched with an exact in-app scan.
+Vectors: pHash lives in the flat 64-dim graph (each image's pHash is stored
+as 64 floats of ±1 via ``VADD`` so ``VSEARCH`` returns Hamming-ordered
+near-duplicates, cosine_dist = hamming/32). Face (512-dim) and CLIP (512-dim)
+embeddings live in their own StrikeDB namespaces via ``VADDNS``/``VSEARCHNS``
+so they never collide with the 64-dim graph. Color histograms ride along in
+the metadata JSON and are matched with an exact in-app scan.
 """
 
 from __future__ import annotations
@@ -68,6 +70,12 @@ class StrikeDbStorage(Storage):
 
     def vsearch(self, k: int, vector: list[float]) -> list[tuple[int, float]]:
         return self._client.vsearch(k, vector)
+
+    def vadd_ns(self, namespace: str, id: int, vector: list[float]) -> None:
+        self._client.vadd_ns(namespace, id, vector)
+
+    def vsearch_ns(self, namespace: str, k: int, vector: list[float]) -> list[tuple[int, float]]:
+        return self._client.vsearch_ns(namespace, k, vector)
 
     def close(self) -> None:
         self._client.disconnect()

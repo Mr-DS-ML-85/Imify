@@ -128,10 +128,32 @@ resize, brightness shift, watermark) stays within the near band and is found;
 an unrelated image is rejected (`found=false` → "search not found").
 
 Fused distance: `0.5·pHash + 0.3·dHash + 0.2·aHash` (each normalized to 0-1),
-with `fused_exact_threshold=0.08` (exact) and `fused_near_threshold=0.22`
-(near). Candidates are fetched concurrently (`web_verify_concurrency=6`, capped
-at `web_verify_max_candidates=24`) with a short timeout each so a slow host
-never stalls the search.
+with `fused_exact_threshold=0.14` (exact) and `fused_near_threshold=0.35`
+(near) — loosened so real re-encoded/downloaded copies of the same image verify
+as near instead of being dropped. Candidates are fetched concurrently
+(`web_verify_concurrency=10`, capped at `web_verify_max_candidates=80`) with a
+short timeout each so a slow host never stalls the search.
+
+### "Found on N sites" consolidation
+
+Same photo surfaced by several engines and sites (re-encoded/downloaded copies)
+shares the same perceptual hash of the *actual verified bytes*
+(`content_phash`). Results whose content pHashes are within `search_dedup_threshold`
+Hamming bits are consolidated into ONE result whose `source_urls`/`source_count`
+carry every site — TinEye's "found on N sites" removal list — instead of four
+near-identical tiles. Different images (even visually similar ones) have
+different hashes and stay separate. Unverified candidates never merge into a
+confirmed group.
+
+### Optional AI + OCR layers (self-hosted)
+
+`app/ai.py` talks to a local Ollama server when configured: a vision model
+auto-captions indexed images (`AI_CAPTION_ON_INDEX=true`) as searchable alt-text,
+and `/v1/search/text` embeds the query + captions and ranks by cosine similarity.
+`app/ocr.py` wraps a local tesseract: indexed images' visible text is stored and
+`/v1/search/ocr` keyword-matches it. Both degrade cleanly — with them off, the
+pure perceptual pipeline runs identically. `app/consolidate` (in `matcher.py`)
+is independent of both.
 
 ### Hotlink-protected CDNs (Facebook) — cookies + browser render
 

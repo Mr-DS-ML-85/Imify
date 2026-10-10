@@ -89,6 +89,8 @@ def _make_matcher(tmp_path, cookie_file, proxify_fetch_url=""):
     from app.storage import SqliteStorage
 
     settings = Settings(
+        _env_file=None,
+        uploads_dir=str(tmp_path / "data" / "uploads"),
         storage_backend="sqlite",
         sqlite_path=str(tmp_path / "t.db"),
         data_dir=str(tmp_path / "data"),
@@ -227,6 +229,8 @@ def test_verify_render_budget_caps_renders(tmp_path, monkeypatch):
     from app.storage import SqliteStorage
 
     settings = Settings(
+        _env_file=None,
+        uploads_dir=str(tmp_path / "data" / "uploads"),
         storage_backend="sqlite",
         sqlite_path=str(tmp_path / "t.db"),
         data_dir=str(tmp_path / "data"),

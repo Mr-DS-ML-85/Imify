@@ -54,6 +54,17 @@ class Storage(ABC):
     @abstractmethod
     def vsearch(self, k: int, vector: list[float]) -> list[tuple[int, float]]: ...
 
+    # Namespaced ANN (StrikeDB VADDNS/VSEARCHNS). Each namespace owns its own
+    # dimension, so 512-dim face and CLIP embeddings can live alongside the
+    # 64-dim pHash graph without dimension conflicts. The base default routes
+    # to the flat API so backends (test doubles) that lack namespaces still
+    # compile — real namespaced search only happens on StrikeDB.
+    def vadd_ns(self, namespace: str, id: int, vector: list[float]) -> None:
+        self.vadd(id, vector)
+
+    def vsearch_ns(self, namespace: str, k: int, vector: list[float]) -> list[tuple[int, float]]:
+        return self.vsearch(k, vector)
+
     # --- JSON helpers ---------------------------------------------------
     def get_json(self, key: str) -> dict[str, Any] | None:
         raw = self.get(key)

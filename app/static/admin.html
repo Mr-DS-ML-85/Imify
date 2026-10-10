@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Imify Admin — index & pipeline</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236c8cff' stroke-width='2'%3E%3Cpath d='M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6z'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/app.css?v=3">
+<link rel="stylesheet" href="/static/app.css?v=4">
 </head>
 <body>
 
@@ -71,6 +71,18 @@
   </div>
 
   <div class="panel">
+    <h2>Face-ID index <span class="pill" id="face-pill">–</span></h2>
+    <p class="sub" style="margin:6px 0 12px">ArcFace embeddings power "find that person" face search. Entries indexed before Face-ID was enabled have no embeddings yet — backfill re-scans stored thumbnails to fill the gap.</p>
+    <div class="add-query" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <span class="chip" id="face-provider-chip" style="cursor:default">provider: –</span>
+      <span style="font-size:12.5px;color:var(--text-faint)" id="face-coverage">0 of 0 images have faces</span>
+      <span style="flex:1"></span>
+      <input type="number" id="face-limit" value="50" min="1" max="1000" title="max entries to scan per run" style="width:70px">
+      <button class="btn primary" id="face-backfill-btn">Backfill faces</button>
+    </div>
+  </div>
+
+  <div class="panel">
     <h2>Background trackers <span class="pill" id="tracks-pill">auto-update</span></h2>
     <p class="sub" style="margin:6px 0 12px">Uploaded/new images are reverse-searched across the whole internet on a schedule (SearXNG → Google via proxify) and every new match is ingested — the index auto-updates over time.</p>
     <div class="add-query" style="display:flex;gap:8px">
@@ -100,6 +112,6 @@
 <div id="toasts"></div>
 <div class="footer"><b>Imify</b> — admin panel. Protect this page: it controls the whole pipeline.</div>
 
-<script src="/static/admin.js?v=3"></script>
+<script src="/static/admin.js?v=4"></script>
 </body>
 </html>

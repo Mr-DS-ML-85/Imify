@@ -304,7 +304,8 @@ def test_search_learn_true_persists_web_hits(client, ctx, monkeypatch):
         data={"mode": "best", "num_results": "10", "include_web": "true", "learn": "true"},
     ).json()
     assert d["found"] is True
-    assert ctx["repo"].pending_count() == 2  # upload + learned web hit
+    # upload indexed under its verified remote url == the learned web hit
+    assert ctx["repo"].pending_count() == 1
 
 
 def test_lru_eviction_caps_index(ctx):
@@ -408,7 +409,9 @@ def test_search_verified_upload_enters_index_and_tracks(client, ctx, monkeypatch
     assert ctx["repo"].pending_count() == 1
     assert len(ctx["repo"].list_tracks()) == 1
     pending = ctx["repo"].db.get_json("pending:" + ctx["repo"].db.keys("pending:")[0][len("pending:"):])
-    assert pending["url"].startswith("http://testserver/uploads/")
+    # canonical link = the remote site that hosts the image, not our loopback copy
+    assert pending["url"] == "https://img.example/m.jpg"
+    assert pending["page_url"] == "https://page.example/x"
     assert pending["engine"] == "upload"
 
 

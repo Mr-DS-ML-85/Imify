@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Imify — Reverse image search on your own stack</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236c8cff' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='7'/%3E%3Cpath d='m21 21-4.3-4.3'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/app.css?v=3">
+<link rel="stylesheet" href="/static/app.css?v=4">
 </head>
 <body>
 
@@ -52,6 +52,15 @@
       <span>Learn matches</span>
     </label>
   </div>
+  <div class="text-row">
+    <div class="text-mode" id="text-mode" title="Search the index by description (AI) or by the text on the image (OCR)">
+      <button class="tm active" data-kind="text">🔎 AI description</button>
+      <button class="tm" data-kind="fulltext">📄 Full text</button>
+      <button class="tm" data-kind="ocr">🔤 OCR text</button>
+    </div>
+    <input type="text" id="text-input" placeholder="Describe what you're looking for, e.g. 'a red car on a beach'">
+    <button id="text-go">Search</button>
+  </div>
 </div>
 
 <div id="results-area" hidden>
@@ -69,6 +78,8 @@
       <button class="tab" data-mode="changed">Most changed</button>
     </div>
   </div>
+  <div class="engine-tabs" id="engine-tabs" hidden></div>
+  <div class="cat-tabs" id="cat-tabs" hidden></div>
   <div class="grid" id="grid"></div>
 </div>
 
@@ -90,6 +101,6 @@
   Index freshness is maintained by the continuous crawler. <span id="backend-info"></span>
 </div>
 
-<script src="/static/app.js?v=3"></script>
+<script src="/static/app.js?v=4"></script>
 </body>
 </html>

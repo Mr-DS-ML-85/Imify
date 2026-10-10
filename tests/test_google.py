@@ -20,10 +20,13 @@ var d = [{"ou":"https://cdn.example.com/photo1.jpg","ru":"https://blog.example.c
 """
 
 
-def test_google_provider_requires_proxify():
-    g = GoogleImagesReverse(proxify_fetch_url="")
-    assert g.available is False
-    with pytest.raises(EngineError, match="PROXIFY_FETCH_URL"):
+def test_google_provider_requires_some_transport(monkeypatch):
+    """Without proxify, Google works only via curl_cffi (chrome146 impersonation).
+    With no transport at all it degrades instead of burning a doomed request."""
+    monkeypatch.setattr("app.engines.google_images._impersonating_session", lambda p: None)
+    g = GoogleImagesReverse(proxify_fetch_url="", fetch_proxy_url="", direct_upload=False)
+    assert g.available is False  # nothing configured -> provider off
+    with pytest.raises(EngineError, match="curl_cffi or PROXIFY_FETCH_URL"):
         g._fetch("https://www.google.com/searchbyimage?image_url=x")
 
 
@@ -139,8 +142,9 @@ def test_google_upload_via_fetch_body_b64(monkeypatch):
 
         return R()
 
+    monkeypatch.setattr("app.engines.google_images._impersonating_session", lambda p: None)
     monkeypatch.setattr("app.engines.google_images.httpx.post", fake_post)
-    g = GoogleImagesReverse(proxify_fetch_url="http://127.0.0.1:8081", fetch_proxy_url="http://127.0.0.1:8888", direct_upload=False)
+    g = GoogleImagesReverse(proxify_fetch_url="http://127.0.0.1:8081", fetch_proxy_url="", direct_upload=False)
     raw = b"\xff\xd8fakejpeg\x00\x01\xfe"
     hits = g.search_upload(raw, filename="q.jpg", content_type="image/jpeg")
 
@@ -162,6 +166,36 @@ def test_google_upload_via_fetch_body_b64(monkeypatch):
     assert any(h.img_src == "https://cdn.example.com/photo1.jpg" for h in hits)
 
 
+def test_google_upload_via_impersonated_direct(monkeypatch):
+    """Fallback: no proxify configured -> curl_cffi chrome146 impersonation
+    (the path that beats Google's TLS-level datacenter block)."""
+    captured = {}
+
+    class _FakeSession:
+        def __init__(self, *a, **k):
+            pass
+
+        def post(self, url, data, headers, allow_redirects):
+            captured.update(url=url, data=data, headers=headers, allow_redirects=allow_redirects)
+
+            class R:
+                status_code = 200
+                text = "<html>" + SAMPLE_GOOGLE_PAGE + "</html>"
+                url = "https://www.google.com/search?vsrid=x"
+
+            return R()
+
+    monkeypatch.setattr("app.engines.google_images._impersonating_session", lambda p: _FakeSession())
+    g = GoogleImagesReverse(proxify_fetch_url="", fetch_proxy_url="", direct_upload=True)
+    raw = b"\xff\xd8fakejpeg\x00\x01\xfe"
+    hits = g.search_upload(raw, filename="q.jpg", content_type="image/jpeg")
+
+    assert captured["url"] == "https://lens.google.com/upload"
+    assert captured["allow_redirects"] is True
+    assert raw in captured["data"]
+    assert any(h.img_src == "https://cdn.example.com/photo1.jpg" for h in hits)
+
+
 def test_google_upload_via_tunnel_fallback(monkeypatch):
     """Fallback: only the CONNECT tunnel configured -> raw bytes through it."""
     captured = {}
@@ -178,6 +212,7 @@ def test_google_upload_via_tunnel_fallback(monkeypatch):
 
         return R()
 
+    monkeypatch.setattr("app.engines.google_images._impersonating_session", lambda p: None)
     monkeypatch.setattr("app.engines.google_images.httpx.post", fake_post)
     g = GoogleImagesReverse(proxify_fetch_url="", fetch_proxy_url="http://127.0.0.1:8888", direct_upload=False)
     raw = b"\xff\xd8fakejpeg\x00\x01\xfe"

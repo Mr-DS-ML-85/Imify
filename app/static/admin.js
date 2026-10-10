@@ -301,6 +301,49 @@ async function refreshKeys() {
   }
 }
 
+/* ------------------------------------------------------------------ face */
+async function refreshFace() {
+  try {
+    const s = await api("/v1/stats");
+    const f = s.face || {};
+    const pil = $("#face-pill");
+    if (!f.enabled) {
+      pil.textContent = "off";
+      pil.className = "pill off";
+    } else {
+      pil.textContent = "on";
+      pil.className = "pill on";
+    }
+    const chip = $("#face-provider-chip");
+    chip.textContent = `provider: ${f.provider || "–"}`;
+    chip.className = "chip " + (f.enabled ? "on" : "off");
+    $("#face-coverage").textContent =
+      `${(f.images_with_faces || 0)} of ${f.images || 0} images have faces`;
+    const btn = $("#face-backfill-btn");
+    btn.disabled = !f.enabled;
+    btn.title = f.enabled ? "Re-embed index entries missing face embeddings" : "Face-ID unavailable (enable FACE_ID_ENABLED + opencv)";
+  } catch { /* auth */ }
+}
+
+function setupFace() {
+  $("#face-backfill-btn").addEventListener("click", async () => {
+    const limit = Math.max(1, parseInt($("#face-limit").value, 10) || 50);
+    const btn = $("#face-backfill-btn");
+    btn.disabled = true;
+    btn.textContent = "Running…";
+    try {
+      const r = await api(`/v1/admin/face/backfill?limit=${limit}`, { method: "POST" });
+      toast(`Backfill done: scanned ${r.scanned} images, added ${r.faces_added} faces`, "ok");
+    } catch (e) {
+      toast("Backfill failed: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Backfill faces";
+      refreshFace();
+    }
+  });
+}
+
 /* ---------------------------------------------------------------- helpers */
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -325,6 +368,7 @@ function refreshAll() {
   refreshKeys().catch(() => {});
   refreshImages().catch(() => {});
   refreshTracks().catch(() => {});
+  refreshFace().catch(() => {});
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -333,6 +377,7 @@ document.addEventListener("DOMContentLoaded", () => {
   setupImages();
   setupTracks();
   setupKeys();
+  setupFace();
   refreshAll();
   setInterval(refreshAll, 15000);
 });

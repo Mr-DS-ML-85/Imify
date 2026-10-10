@@ -153,8 +153,22 @@ def extract_features(img: Image.Image, raw: bytes | None = None) -> dict:
 
 
 def decode_image(raw: bytes) -> Image.Image | None:
-    """Decode image bytes safely; returns None for non-images / corrupt data."""
+    """Decode image bytes safely; returns None for non-images / corrupt data.
+
+    Oversized / decompression-bomb images are rejected BEFORE full decode so a
+    single huge CDN answer (or a crafted zip-of-pixels) cannot balloon memory
+    (a search verifies many candidates concurrently → a few giant images was
+    enough to OOM the whole 29G rig).
+    """
     try:
+        # Peek at the header dimensions without decoding the full pixel grid.
+        with Image.open(io.BytesIO(raw)) as probe:
+            w, h = probe.size
+            if probe.format == "PNG" and (w > 16384 or h > 16384):
+                return None
+            area = w * h
+            if area > 32_000_000:  # ~32 megapixels cap; decodes are bounded
+                return None
         img = Image.open(io.BytesIO(raw))
         img.load()
         img = img.convert("RGB") if img.mode not in ("RGB", "L", "RGBA") else img

@@ -1,0 +1,24 @@
+# Imify optional accelerated/self-hosted layers.
+#
+# Install everything with uv:
+#   uv pip install -r requirements.txt
+#
+# The CORE pipeline (pure perceptual hashing, SearXNG + StrikeDB) needs none of
+# these and works with just `uv sync` (see pyproject.toml). Each extra here is
+# OPTIONAL and degrades cleanly when absent:
+#
+#   onnxruntime      Face-ID + CLIP (ONNX inference) on CPU. Imify is CPU-only:
+#                     no CUDA session is ever initialized (a GPU driver change
+#                     taking CUDA down crashed the whole search previously).
+#   pytesseract      OCR text extraction from indexed images (logos/memes).
+#
+# (AI captioning / natural-language search in app/ai.py uses Ollama over HTTP
+#  and needs NO python extra — just a running `ollama` server.)
+
+# Face-ID + CLIP (CPU ONNX inference). CPU-only by design — no GPU provider.
+onnxruntime>=1.19
+
+# OCR (visible-text extraction). Requires the system `tesseract` binary too:
+#   apt install tesseract-ocr        (Debian/Ubuntu)
+#   brew install tesseract           (macOS)
+pytesseract>=0.3.10

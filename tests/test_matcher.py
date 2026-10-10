@@ -105,3 +105,46 @@ def test_fusion_dedupes_and_prefers_local(ctx):
     assert len(fused) == 1
     assert fused[0].source == "both"
     assert fused[0].url == "https://site.com/a/b.jpg"
+
+
+def test_consolidate_duplicates_groups_by_content_phash():
+    from app.matcher import consolidate_duplicates
+    from app.models import SearchResult
+
+    phash = 0xA5A5A5A5A5A5A5A5
+    # same photo on 3 sites (identical phash charged = same content) + 2 near
+    same = [
+        SearchResult(url="https://a.com/logo.png", source="web", score=0.9, match_type="exact",
+                     content_phash=phash, engine="google images"),
+        SearchResult(url="https://b.com/logo.jpg", source="web", score=0.8, match_type="near",
+                     content_phash=phash ^ 0b11, engine="searx"),  # 2 bits off -> same photo
+        SearchResult(url="https://c.com/logo.webp", source="web", score=0.7, match_type="near",
+                     content_phash=phash ^ 0b101, engine="bing"),  # 2 bits off
+    ]
+    different = SearchResult(url="https://d.com/other.jpg", source="web", score=0.6,
+                             match_type="near", content_phash=phash ^ 0x0FFF)  # far away
+    merged = consolidate_duplicates(same + [different], threshold=8)
+    # 3 same-photo hits collapse into 1 group; different stays separate
+    assert len(merged) == 2
+    # one consolidated group, one standalone different-image result
+    site_group = next(g for g in merged if g.source_count == 3)
+    assert set(site_group.source_urls) == {
+        "https://a.com/logo.png", "https://b.com/logo.jpg", "https://c.com/logo.webp",
+    }
+    # engines merged into a comma list (alphabetical)
+    assert {e.strip() for e in site_group.engine.split(",")} == {"bing", "google images", "searx"}
+
+
+def test_consolidate_keeps_unverified_separate():
+    from app.matcher import consolidate_duplicates
+    from app.models import SearchResult
+
+    phash = 0x1111111111111111
+    verified = SearchResult(url="https://v.com/x.jpg", source="web", score=0.9,
+                            match_type="exact", content_phash=phash)
+    unverified = SearchResult(url="https://u.com/x.jpg", source="web", score=0.05,
+                              match_type="unverified")
+    out = consolidate_duplicates([verified, unverified], threshold=8)
+    assert len(out) == 2
+    assert out[0].url == "https://v.com/x.jpg"        # verified first
+    assert out[-1].match_type == "unverified"          # never merged into a group
