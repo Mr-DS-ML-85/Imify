@@ -165,9 +165,24 @@ curl -s http://127.0.0.1:8081/cookies/status
   contains every logged-in site in your browser. Refresh cookies by
   re-exporting `gui-cookies.txt`, then `scripts/start_proxify.sh --recreate`.
   `/v1/stats` → `cookies` shows live/expired counts per domain.
-- **One honest identity:** the browser is Chromium on Linux, so the script
-  sets the persona (UA + client hints) to exactly that. Faking Windows from a
-  Linux browser is a contradiction anti-bot systems score as automation.
+- **Honest mode (`GUI_HONEST_MODE=true`, default in the script):** the GUI
+  browser presents itself exactly as it is. No injected fingerprint script,
+  no user-agent / client-hint override, no timezone emulation; the container
+  runs in the host's timezone. JavaScript fingerprint shims are detectable
+  (e.g. deleting `navigator.webdriver` makes it `undefined` instead of
+  `false`), and claiming Windows from a Linux browser is a contradiction
+  anti-bot systems score as automation. Real values are consistent.
+- **Branded Google Chrome:** Playwright's bundled Chromium is "Chrome for
+  Testing" (no "Google Chrome" brand in `navigator.userAgentData`, a known
+  automation marker). Build the thin image once and the script uses it
+  automatically:
+
+  ```bash
+  docker build -f docker/Dockerfile.proxify-chrome -t proxify-chrome:latest docker/
+  scripts/start_proxify.sh --recreate
+  ```
+- **Self-check:** fetch `https://bot-detector.rebrowser.net/` through
+  proxify's `gui_chrome` and read the verdicts; everything should be green.
 - **Native network stack:** `GUI_TLS_MITM=false` (default in the script)
   lets Chrome connect to sites itself (its own TLS, HTTP/2, QUIC). Set
   `GUI_TLS_MITM=true` to route it through proxify's TLS-impersonating MITM.

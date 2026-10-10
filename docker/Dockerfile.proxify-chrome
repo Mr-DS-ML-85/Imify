@@ -1,0 +1,13 @@
+# Proxify + official Google Chrome stable for the GUI browser.
+# Playwright's Chromium is "Chrome for Testing": navigator.userAgentData has no
+# "Google Chrome" brand, a well-known automation-browser marker. Real users run
+# branded Chrome — so does the GUI browser now. Base image is unchanged.
+FROM proxy-orchestrator-orchestrator:latest
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends wget ca-certificates \
+ && wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+ && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+ && rm -f /tmp/chrome.deb \
+ && rm -rf /var/lib/apt/lists/* \
+ && google-chrome-stable --version

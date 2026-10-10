@@ -8,6 +8,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 NAME=proxy-orchestrator
+# proxify-chrome = base image + official Google Chrome (docker/Dockerfile.proxify-chrome)
+IMAGE=proxy-orchestrator-orchestrator:latest
+docker image inspect proxify-chrome:latest >/dev/null 2>&1 && IMAGE=proxify-chrome:latest
 # Only search-engine / Facebook sessions go into the bot browser — never the
 # whole exported cookie jar (password managers, mail, shops...).
 COOKIES="$PWD/data/proxify-cookies.txt"
@@ -16,12 +19,15 @@ if [ -f gui-cookies.txt ]; then python3 scripts/filter_cookies.py gui-cookies.tx
 # browser IS Chromium on Linux, so every signal — UA, client hints, platform —
 # says exactly that. Claiming Windows Chrome 146 from a Linux Chromium 153 was a
 # contradiction Google's risk engine scores as automation (-> CAPTCHA).
-CHROME_MAJOR="${CHROME_MAJOR:-$(docker run --rm --entrypoint sh "proxy-orchestrator-orchestrator:latest" -c 'f=$(find /ms-playwright -name chrome -path "*chrome-linux64*" -type f | head -1); "$f" --version 2>/dev/null' | grep -oE '[0-9]+' | head -1)}"
+CHROME_MAJOR="${CHROME_MAJOR:-$(docker run --rm --entrypoint sh "$IMAGE" -c 'f=/usr/bin/google-chrome-stable; [ -x "$f" ] || f=$(find /ms-playwright -name chrome -path "*chrome-linux64*" -type f | head -1); "$f" --version 2>/dev/null' | grep -oE '[0-9]+' | head -1)}"
 CHROME_MAJOR="${CHROME_MAJOR:-153}"
+# the browser's clock must match where the IP is (a UTC clock on a Dhaka IP is
+# an automation tell) — use the host's own timezone, natively
+HOST_TZ="$(timedatectl show -p Timezone --value 2>/dev/null || readlink /etc/localtime | sed 's#.*/zoneinfo/##')"
+HOST_TZ="${HOST_TZ:-UTC}"
 PERSONA_UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${CHROME_MAJOR}.0.0.0 Safari/537.36"
 PERSONA_SEC_CH_UA="\"Chromium\";v=\"${CHROME_MAJOR}\", \"Google Chrome\";v=\"${CHROME_MAJOR}\", \"Not.A/Brand\";v=\"99\""
 [ "${1:-}" = "--recreate" ] && docker rm -f "$NAME" >/dev/null 2>&1 || true
-IMAGE=proxy-orchestrator-orchestrator:latest
 if docker ps --format '{{.Names}}' | grep -qx "$NAME"; then echo "$NAME already running"; exit 0; fi
 docker rm "$NAME" >/dev/null 2>&1 || true
 # A profile carried over from a previous container still holds Chromium's
@@ -36,9 +42,9 @@ docker run -d --name "$NAME" --network proxy-orchestrator_default \
   -e LOG_LEVEL=INFO \
   -e PERSONA_UA="$PERSONA_UA" -e PERSONA_PLATFORM='"Linux"' -e PERSONA_PLATFORM_VERSION=6.8.0 \
   -e PERSONA_SEC_CH_UA="$PERSONA_SEC_CH_UA" \
-  -e GUI_TLS_MITM="${GUI_TLS_MITM:-false}" \
+  -e GUI_TLS_MITM="${GUI_TLS_MITM:-false}" -e GUI_HONEST_MODE="${GUI_HONEST_MODE:-true}" \
   -v "$PWD/reference/proxify/proxy-orchestrator/strategies/gui_chrome.py:/app/strategies/gui_chrome.py:ro" \
-  -v "$PWD/reference/proxify/proxy-orchestrator/scripts/gui_browser.sh:/app/scripts/gui_browser.sh:ro" -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright -e TZ=UTC \
+  -v "$PWD/reference/proxify/proxy-orchestrator/scripts/gui_browser.sh:/app/scripts/gui_browser.sh:ro" -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright -e TZ="$HOST_TZ" \
   -v proxify-gui-profile:/app/gui-profile \
   $( [ -f "$COOKIES" ] && echo "-v $COOKIES:/app/gui-cookies.txt:ro -e COOKIE_FILE=/app/gui-cookies.txt" ) \
   --shm-size 1g --init --restart unless-stopped "$IMAGE" >/dev/null
