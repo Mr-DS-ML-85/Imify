@@ -54,7 +54,8 @@ from app.config import Settings
 from app.cookies import cookie_health
 from app.engines import run_reverse_chain
 from app.engines.bing_images import BingImagesReverse
-from app.engines.text_images import TextImageDiscovery, derive_queries, is_iconlike
+from app.engine_guard import EngineGuard
+from app.engines.text_images import BROWSER_SEARCH_URLS, TextImageDiscovery, derive_queries, is_iconlike
 from app.engines.google_images import GoogleImagesReverse
 from app.engines.yandex_images import YandexImagesReverse
 from app.features import decode_image, extract_features, hash_variants
@@ -224,12 +225,14 @@ def build_api(
         out.sort(key=lambda r: (MATCH_FAMILY_RANK.get(r.match_type, 3), -r.score))
         return out[: limit * 3]
 
+    guard = EngineGuard(repo.db)
     text_discovery = text_discovery or TextImageDiscovery(
         settings.searxng_url,
         proxify_fetch_url=settings.proxify_fetch_url,
         timeout=settings.searxng_timeout_seconds,
         engines=[e.strip() for e in settings.text_discovery_engines.split(",") if e.strip()] or None,
         browser_fallback_max=settings.text_discovery_browser_max,
+        guard=guard,
     )
 
     def _text_discover(hits: list, img, phase_start: float) -> tuple[list, str, dict]:
@@ -404,6 +407,10 @@ def build_api(
                 "images": repo.image_count(),
             },
             "cookies": cookie_health(settings.cookie_file),
+            "engine_guard": guard.status(
+                ["yandex-upload", "bing-upload", "google-upload"]
+                + [f"browser:{e}" for e in BROWSER_SEARCH_URLS]
+            ),
             "facebook_resolution": {
                 "enabled": settings.facebook_resolution_enabled,
                 **repo.provider_stats().get("facebook-render", {}),
@@ -689,9 +696,13 @@ def build_api(
                         # leave time for verification inside the same budget
                         budget=settings.web_phase_budget_seconds * 0.7,
                         face_crop=_face_crop_bytes(settings, ai_img, query_faces),
+                        guard=guard,
                     )
                     # record per-provider success so success-rate metrics are honest
                     for eng, ok in hit_by_engine.items():
+                        if ok is None:  # skipped by the guard (cooldown / pacing) — not tried
+                            degraded.append(f"cooldown:{eng}")
+                            continue
                         repo.record_provider(f"{eng}-upload", ok=ok)
                         if not ok:
                             degraded.append(f"provider:{eng}-upload")
@@ -1428,7 +1439,8 @@ def _byte_upload_all(
     phase_start: float,
     budget: float,
     face_crop: bytes | None = None,
-) -> tuple[list, dict[str, bool]]:
+    guard: EngineGuard | None = None,
+) -> tuple[list, dict[str, bool | None]]:
     """Run every enabled byte-upload engine in PARALLEL and merge candidates.
 
     TinEye model: no single engine sees the whole web. Yandex (least-censored,
@@ -1466,6 +1478,28 @@ def _byte_upload_all(
         return [], {}
 
     per_engine: dict[str, list] = {}
+    skipped: dict[str, str] = {}
+
+    def _guarded(engine: str, eng) -> list:
+        """EngineGuard around one engine call: skip while it cools down after
+        a block, pace it (jittered min interval), feed the outcome back."""
+        if guard is None or engine == "searx":  # own SearXNG: nothing to hide from
+            return _run(engine, eng)
+        cool_key = "yandex-upload" if engine == "yandex-face" else f"{engine}-upload"
+        allowed, why = guard.allow(cool_key)
+        if not allowed:
+            skipped[engine] = why
+            return []
+        if not guard.pace(engine if engine == "yandex-face" else cool_key):
+            skipped[engine] = "paced (engine used moments ago)"
+            return []
+        try:
+            out = _run(engine, eng)
+        except Exception as exc:
+            guard.report(cool_key, ok=False, text=str(exc))
+            raise
+        guard.report(cool_key, ok=True)
+        return out
 
     def _run(engine: str, eng) -> list:
         if engine == "yandex":
@@ -1481,7 +1515,7 @@ def _byte_upload_all(
     # The budget is enforced for real: on timeout the pool is abandoned
     # without waiting (a `with` block would block on the slowest engine).
     pool = ThreadPoolExecutor(max_workers=len(tasks))
-    futures = {pool.submit(_run, e, eng): e for e, eng in tasks}
+    futures = {pool.submit(_guarded, e, eng): e for e, eng in tasks}
     try:
         remaining = None if budget is None else max(0.5, budget - (time.monotonic() - phase_start))
         for fut in as_completed(futures, timeout=remaining):
@@ -1526,7 +1560,10 @@ def _byte_upload_all(
             seen.add(img_src)
             merged.append(hit)
 
-    hit_by_engine = {e: bool(per_engine.get(e)) for e, _ in tasks}
+    # None = skipped by the guard (not a failure: the engine was not asked)
+    hit_by_engine: dict[str, bool | None] = {
+        e: (None if e in skipped else bool(per_engine.get(e))) for e, _ in tasks
+    }
     return merged, hit_by_engine
 
 

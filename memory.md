@@ -63,6 +63,19 @@ Not touched — needs the user's go-ahead (fix the unit's paths to `/run/media/i
   (now re-encoded to JPEG for engines); SearXNG reverse fallback text-searched "reverse image search" (junk
   candidates) — removed; engine label duplication on merge.
 
+**2026-10-10 (part 3) — service + stealth (no CAPTCHA solving, by user's choice):**
+- `~/.config/systemd/user/imify.service` repointed to `/run/media/irfan/models/imify` (backup `.bak`); runs
+  `.venv/bin/python -m uvicorn`, ExecStartPre = start_strikedb.sh + start_proxify.sh (idempotent). Active on :8010.
+- BrowserPilot (`reference/BrowserPilot`) ideas adopted: (1) ONE honest persona — GUI browser is Chromium 153/Linux, so
+  UA + client hints say exactly that (`start_proxify.sh` env; `gui_chrome.py` derives brands/platform from PERSONA_UA,
+  file is MOUNTED into the container so recreation keeps it); (2) back off instead of pushing through:
+  `app/engine_guard.py` — per-engine jittered pacing (google 12s, yandex 4s, bing 3s), block detection, exponential
+  cooldown 10min→6h persisted in storage (`eg:*`), google daily budget; wired into live byte-uploads, tracker uploads
+  and text-discovery browser retries; `/v1/stats.engine_guard` shows state; skipped engines appear as `cooldown:<engine>`.
+  BrowserPilot's solve_captcha is deliberately NOT used.
+- Profile volume gotcha: stale Chromium SingletonLock from an old container hostname blocks GUI Chrome —
+  start_proxify.sh clears it before launch.
+
 ---
 
 ## 1. WHAT THIS PRODUCT IS

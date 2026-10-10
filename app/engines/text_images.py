@@ -35,6 +35,7 @@ import httpx
 import numpy as np
 from PIL import Image
 
+from app.engine_guard import looks_blocked
 from app.logging import child_logger
 from app.models import ImageHit
 from app.searx import DEFAULT_UA
@@ -312,12 +313,14 @@ class TextImageDiscovery:
         timeout: float = 12.0,
         engines: list[str] | None = None,
         browser_fallback_max: int = 2,
+        guard=None,
     ):
         self.searxng_url = searxng_url.rstrip("/")
         self.proxify_fetch_url = proxify_fetch_url.rstrip("/")
         self.timeout = timeout
         self.engines = [e for e in (engines or list(WEB_ENGINES) + list(GENERAL_ENGINES)) if e]
         self.browser_fallback_max = browser_fallback_max
+        self.guard = guard  # EngineGuard: pacing + block cooldown for browser retries
 
     @property
     def available(self) -> bool:
@@ -364,7 +367,15 @@ class TextImageDiscovery:
         template = BROWSER_SEARCH_URLS.get(engine)
         if not template or not self.proxify_fetch_url:
             return []
+        key = f"browser:{engine}"
+        if self.guard is not None:
+            allowed, _why = self.guard.allow(key)
+            if not allowed or not self.guard.pace(key):
+                return []
+        # natural entry: the engine's own results URL with the parameters its
+        # UI sends, referred from its homepage (a cold deep link is a bot tell)
         url = template.format(q=quote_plus(query))
+        home = f"{urlparse(url).scheme}://{urlparse(url).netloc}/"
         resp = httpx.post(
             self.proxify_fetch_url + "/fetch",
             json={
@@ -375,14 +386,19 @@ class TextImageDiscovery:
                 "timeout": 40,
                 "bypass_cache": True,
                 "wait_selector": "img",
-                "headers": {"Accept-Language": "en-US,en;q=0.9"},
+                "headers": {"Accept-Language": "en-US,en;q=0.9", "Referer": home},
             },
             timeout=70,
         )
         resp.raise_for_status()
         data = resp.json()
         page = data.get("html") or ""
-        if not page or "captcha" in str(data.get("error", "")).lower():
+        err = str(data.get("error") or "")
+        # a challenge page is a block signal: back off instead of retrying
+        blocked = looks_blocked(err) or (len(page) < 20000 and looks_blocked(page[:20000]))
+        if self.guard is not None:
+            self.guard.report(key, ok=bool(page) and not blocked, text=err if err else (page[:4000] if blocked else ""))
+        if not page or blocked:
             return []
         if engine == "bing images":
             hits = parse_bing_images(page)

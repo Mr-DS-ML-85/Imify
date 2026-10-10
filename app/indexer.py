@@ -36,6 +36,7 @@ from app.engines.bing_images import BingImagesReverse
 from app.engines.google_images import GoogleImagesReverse
 from app.engines.yandex_images import YandexImagesReverse
 from app.clip import Clipper
+from app.engine_guard import EngineGuard
 from app.features import decode_image, extract_features, hamming
 from app.face import FaceId
 from app.logging import child_logger
@@ -124,6 +125,8 @@ class Indexer:
             fetch_proxy_url=settings.fetch_proxy_url,
         )
         self.ai = ai
+        # background work may wait longer for an engine slot than a live search
+        self.guard = EngineGuard(repo.db, max_wait=60.0)
         self.log = child_logger("imify.indexer", worker="indexer")
         self.status = PipelineStatus()
         self._stop = threading.Event()
@@ -447,6 +450,23 @@ class Indexer:
         self.repo.register_url(url, meta.id)
         self.log.debug("deduped", extra={"event": "dedup", "image_id": meta.id, "url": url})
 
+    # ------------------------------------------------------- engine guard
+    def _guarded_call(self, key: str, fn):
+        """Background tracker calls go through the same EngineGuard as live
+        searches: skipped while the engine cools down after a block, paced
+        with jitter, and the outcome is fed back. A skip returns no hits."""
+        allowed, why = self.guard.allow(key)
+        if not allowed or not self.guard.pace(key):
+            self.log.info("tracker skipped engine", extra={"engine": key, "reason": why or "paced"})
+            return []
+        try:
+            out = fn()
+        except Exception as exc:
+            self.guard.report(key, ok=False, text=str(exc))
+            raise
+        self.guard.report(key, ok=True)
+        return out
+
     # ------------------------------------------------------- AI backfill
     def _ai_backfill_loop(self) -> None:
         """Keep every index entry's face/CLIP embeddings current.
@@ -613,7 +633,7 @@ class Indexer:
                 raw = path.read_bytes()
                 if self.settings.bing_upload_enabled:
                     try:
-                        hits = self.bing.search_upload(raw, filename=path.name)
+                        hits = self._guarded_call("bing-upload", lambda: self.bing.search_upload(raw, filename=path.name))
                         self.repo.record_provider("bing-upload", ok=True)
                     except Exception as exc:  # noqa: BLE001 — degrade, never crash the loop
                         self.repo.record_provider("bing-upload", ok=False)
@@ -621,7 +641,7 @@ class Indexer:
                         self.log.warning("track bing-upload failed", extra={"event": "track_upload_fail", "error": str(exc)})
                 if not hits and self.settings.yandex_upload_enabled:
                     try:
-                        hits = self.yandex.search_upload(raw, filename=path.name)
+                        hits = self._guarded_call("yandex-upload", lambda: self.yandex.search_upload(raw, filename=path.name))
                         self.repo.record_provider("yandex-upload", ok=True)
                     except Exception as exc:  # noqa: BLE001 — degrade, never crash the loop
                         self.repo.record_provider("yandex-upload", ok=False)
@@ -629,7 +649,7 @@ class Indexer:
                         self.log.warning("track yandex-upload failed", extra={"event": "track_upload_fail", "error": str(exc)})
                 if not hits and self.settings.google_upload_enabled:
                     try:
-                        hits = self.google.search_upload(raw, filename=path.name)
+                        hits = self._guarded_call("google-upload", lambda: self.google.search_upload(raw, filename=path.name))
                         self.repo.record_provider("google-upload", ok=True)
                     except Exception as exc:  # noqa: BLE001 — degrade, never crash the loop
                         self.repo.record_provider("google-upload", ok=False)
