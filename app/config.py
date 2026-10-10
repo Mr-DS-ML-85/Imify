@@ -154,9 +154,19 @@ class Settings(BaseSettings):
     # Laplacian-variance blur ceiling: a query below this is "blurry" and gets
     # restored before hashing/web-upload. Higher = restore more aggressively.
     enhance_blur_limit: float = 90.0
+    # Real-ESRGAN restores only LOW-resolution queries (width*height at or
+    # below this); higher-resolution images are left as they are.
+    enhance_max_pixels: int = 250_000  # ~500x500; x4plus costs ~110 s per input MP on CPU
     # Apply the enhanced pixels to the web engines' uploaded copy too (sharper
     # query for the reverse engines). Costs the enhance time on the hot path.
     enhance_before_web_upload: bool = False
+    # Where ESRGAN and BiRefNet run: "auto" places each on the GPU when its
+    # VRAM need fits the free VRAM (bigger model first), else in system RAM;
+    # "cpu" / "gpu" force both. Needs a CUDA build of onnxruntime for the GPU;
+    # a failing GPU run falls back to RAM. VRAM needs are estimates in MB.
+    enhance_device: str = "auto"
+    enhance_esrgan_vram_mb: int = 1500
+    enhance_birefnet_vram_mb: int = 4500
 
     # --- Storage ---
     # "strikedb" (default) or "sqlite" (dev/test fallback).

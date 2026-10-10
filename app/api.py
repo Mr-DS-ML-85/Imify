@@ -102,6 +102,10 @@ def build_api(
         enabled=settings.enhancer_enabled,
         models_dir=str(settings.enhance_models_dir),
         blur_limit=settings.enhance_blur_limit,
+        max_pixels=settings.enhance_max_pixels,
+        device=settings.enhance_device,
+        esrgan_vram_mb=settings.enhance_esrgan_vram_mb,
+        birefnet_vram_mb=settings.enhance_birefnet_vram_mb,
     )
 
     # one shared model instance per layer (matcher verifies web candidates
@@ -419,6 +423,8 @@ def build_api(
                 "enabled": enhancer.enabled,
                 "available": enhancer.available,
                 "blur_limit": settings.enhance_blur_limit,
+                "max_pixels": settings.enhance_max_pixels,
+                "placement": enhancer.placement,
             },
             "uptime_s": round(time.time() - indexer.status.started) if indexer.status.started else 0,
         }

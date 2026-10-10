@@ -74,6 +74,10 @@ enhancer = Enhancer(
     enabled=settings.enhancer_enabled,
     models_dir=str(settings.enhance_models_dir),
     blur_limit=settings.enhance_blur_limit,
+    max_pixels=settings.enhance_max_pixels,
+    device=settings.enhance_device,
+    esrgan_vram_mb=settings.enhance_esrgan_vram_mb,
+    birefnet_vram_mb=settings.enhance_birefnet_vram_mb,
 )
 google = GoogleImagesReverse(
     settings.proxify_fetch_url,
