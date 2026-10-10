@@ -1,4 +1,7 @@
-# Imify — SESSION HANDOFF (resume here)
+# Imify — SESSION HANDOFF (historical, 2026-08-05)
+
+> **Superseded.** As of 2026-10-10 Yandex uploads return verified matches again and Google Lens
+> byte-upload works via proxify's in-page upload (see `docs/PROBLEMS.md` P2 and `memory.md` §0). Current state lives in `memory.md`; this file is kept only as a record.
 
 > Read `memory.md` first, then this file. This captures the EXACT in-flight state of the
 > current debugging (YouTuber-face accuracy + FB-logo zero-hits) so the next session

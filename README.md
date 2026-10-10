@@ -236,33 +236,78 @@ curl -s http://127.0.0.1:8010/health/ready
 
 ## API
 
-| Endpoint | Auth | Description |
-|---|---|---|
-| `POST /v1/search` | key\* | Reverse search. `multipart` `file`, or `image_url`, or `image_id`. Query params: `mode` (`best\|color\|biggest\|newest\|changed\|exact`), `num_results`, `include_web`. |
-| `POST /v1/search/text` | key\* | Natural-language search over AI captions (needs Ollama). |
-| `POST /v1/search/ocr` | key\* | Keyword search over OCR text in indexed images (needs tesseract). |
-| `GET /v1/image/{id}` | – | Indexed image metadata. |
-| `GET /v1/history` | – | Recent searches. |
-| `GET /v1/stats` | – | Index statistics. |
-| `GET /health/live`, `/health/ready` | – | Probes. |
-| `GET /metrics` | – | Prometheus text format. |
-| `POST /v1/admin/ingest` | admin | `{"queries": ["q1", ...], "urls": ["https://..."]}` — seed queries and/or specific image URLs. |
-| `GET /v1/admin/queries` · `PATCH/DELETE /v1/admin/queries/{id}` | admin | Seed query management. |
-| `GET /v1/admin/crawl` | admin | Pipeline status. |
-| `GET /v1/admin/images?q=&limit=&offset=` | admin | List indexed images (filter by URL/title/engine). |
-| `DELETE /v1/admin/images/{id}` | admin | Remove one image from the index. |
-| `POST /v1/admin/images/purge` | admin | Bulk-remove: `{"url_contains": "example.com", "query": "..."}`. |
-| `GET /v1/admin/tracks` · `PATCH/DELETE /v1/admin/tracks/{id}` | admin | Background tracker management (auto-update). |
-| `POST /v1/admin/tracks/run` | admin | Run one tracker round now. |
-| `POST /v1/admin/keys` · `GET` · `DELETE /{name}` | admin | API keys (SHA-256 hashed at rest). |
+Everything the web UI does goes through this API — the UI is a static page
+that calls these endpoints and nothing else, so any search or admin action
+can be scripted. Paste and drag-drop are the same `file` upload; the result
+sections (Copies / Same person / Visually similar / Unconfirmed) are built
+from each result's `match_type`. A few endpoints have no UI button
+(`/v1/search/face`, `/v1/search/clip`, `mode=exact`,
+`/v1/admin/clip/backfill`, `/v1/image/{id}`, `/metrics`).
 
-\* `AUTH_MODE=key` requires a key for all `/v1/*`; `AUTH_MODE=open` (default)
-only requires keys for admin endpoints.
+**Auth:** send a key as `Authorization: Bearer sk_...` or `X-API-Key: sk_...`.
+`AUTH_MODE=open` (default) needs a key only for `/v1/admin/*` (role `admin`);
+`AUTH_MODE=key` needs one for every `/v1/*` call.
+
+### Search (multipart form fields)
+
+| Endpoint | Fields | What it does | UI |
+|---|---|---|---|
+| `POST /v1/search` | `file` **or** `image_url` **or** `image_id`; `mode` (`best`·`color`·`biggest`·`newest`·`changed`·`exact`, default `best`); `num_results` (default 40); `include_web` (default `true`); `learn` (default `false` — `true` adds verified web matches to the index) | Reverse image search: local index + Yandex/Bing/Google Lens byte uploads + text discovery, every candidate verified (hash, SIFT geometry, face, CLIP) | upload / paste / URL / "search again" / mode tabs (all but `exact`, which is API-only) / *Learn matches* toggle |
+| `POST /v1/search/text` | `query`, `num_results` | Natural-language search over AI captions (needs Ollama; 503 when off) | text search → *AI description* |
+| `POST /v1/search/ocr` | `query`, `num_results` | Keyword search over OCR text in indexed images | text search → *OCR text* |
+| `POST /v1/search/fulltext` | `query`, `num_results` | Keyword search over every text field (title, URL, caption, OCR) | text search → *Full text* |
+| `POST /v1/search/face` | `file`, `num_results` | Same person across the indexed library (ArcFace) | API only (face matches are also part of `/v1/search`) |
+| `POST /v1/search/clip` | `file`, `num_results` | Semantically similar scenes (CLIP) | API only (also part of `/v1/search`) |
+
+The response (`SearchResponse`) carries `found`, `total`, `took_ms`,
+`providers`, `degraded` (engines that failed or were skipped, e.g.
+`provider:google-upload`, `cooldown:google`), `cached`, `best_guess`,
+`discovery`, `by_engine`, `by_category` and `results[]` — each result has
+`match_type` (`exact`·`near`·`modified`·`face`·`similar`·`unverified`),
+`score`, `engine`, `title`, `page_url`, image URLs and evidence.
+
+### Read-only
+
+| Endpoint | Description |
+|---|---|
+| `GET /v1/stats` | Index statistics, success rates, engine guard state (cooldowns, daily budgets) — the admin *Success rates* panel |
+| `GET /v1/history?limit=20` | Recent searches |
+| `GET /v1/image/{id}` | One indexed image's metadata |
+| `GET /img/{name}` | Stored thumbnails / uploads |
+| `GET /health/live`, `/health/ready` | Probes |
+| `GET /metrics` | Prometheus text format |
+
+### Admin (`admin` key)
+
+| Endpoint | Description | UI (`/admin`) |
+|---|---|---|
+| `POST /v1/admin/ingest` | `{"queries": ["q1", ...], "urls": ["https://..."]}` — seed queries and/or specific image URLs | Seed queries |
+| `GET /v1/admin/queries` · `PATCH /{id}` `{"enabled": bool}` · `DELETE /{id}` | Seed query management | Seed queries |
+| `GET /v1/admin/crawl` | Pipeline status | Pipeline status |
+| `GET /v1/admin/images?q=&limit=&offset=` | List indexed images (filter by URL/title/engine) | Indexed images |
+| `DELETE /v1/admin/images/{id}` | Remove one image | Indexed images |
+| `POST /v1/admin/images/purge` | Bulk remove: `{"url_contains": "example.com", "query": "..."}` | Indexed images |
+| `GET /v1/admin/tracks` · `PATCH /{id}` `{"enabled": bool}` · `DELETE /{id}` | Background trackers (auto-update) | Background trackers |
+| `POST /v1/admin/tracks/run` | Run one tracker round now | Background trackers |
+| `POST /v1/admin/face/backfill?limit=50&force=false` | (Re-)embed faces | Face-ID index |
+| `POST /v1/admin/clip/backfill?limit=50` | Embed CLIP vectors | API only |
+| `POST /v1/admin/keys` `{"name", "role"}` · `GET` · `DELETE /{name}` | API keys (SHA-256 hashed at rest; the key is shown once) | API keys |
 
 ```bash
-curl -F "file=@photo.jpg" -F "mode=best" http://localhost:8000/v1/search
-curl -H "Authorization: Bearer sk_..." http://localhost:8000/v1/admin/queries
+# reverse search a file, a URL, or an indexed image
+curl -F "file=@photo.jpg" -F mode=best -F num_results=60 http://localhost:8000/v1/search
+curl -F "image_url=https://example.com/a.jpg" http://localhost:8000/v1/search
+curl -F "image_id=42" -F mode=newest -F include_web=false http://localhost:8000/v1/search
+# keep verified web matches in the index (the UI's Learn toggle)
+curl -F "file=@photo.jpg" -F learn=true http://localhost:8000/v1/search
+# text searches
+curl -F "query=red bicycle" http://localhost:8000/v1/search/fulltext
+# admin
+curl -H "Authorization: Bearer sk_..." -H 'Content-Type: application/json' \
+  -d '{"queries": ["eiffel tower"]}' http://localhost:8000/v1/admin/ingest
 ```
+
+The systemd service on this box listens on `127.0.0.1:8010`; Docker uses `:8000`.
 
 ## Configuration
 
@@ -320,22 +365,25 @@ degrade honestly (tracker note: *"no public URL"*). Tracker candidates are
 images can never pollute the index (tracks store all three hashes; legacy
 tracks fall back to pHash-only).
 
-### Google reverse = proxify only (TinEye / Circle-to-Search style)
+### Google reverse = Google Lens through Proxify's browser
 
-Google answers `searchbyimage` with a `sorry` block to datacenter IPs. Imify
-never fetches Google directly — the `google` provider is **proxify-only** and
-degrades (`provider:google` in `degraded`) when `PROXIFY_FETCH_URL` is unset.
-Start your [proxify](https://github.com/Mr-DS-ML-85/proxify) gateway and point
-it here. Proxify's default API port is 8080 — if SearXNG already owns 8080 on
-your box, run proxify with `API_PORT=8081` and set `PROXIFY_FETCH_URL=http://127.0.0.1:8081`.
+Imify never talks to Google directly — the Google engine needs
+[Proxify](https://github.com/Mr-DS-ML-85/proxify) (`PROXIFY_FETCH_URL`,
+`:8081` here because SearXNG owns `:8080`) and degrades
+(`provider:google-upload` in `degraded`) without it.
 
-**Circle-to-Search for images with no online links:** a brand-new upload has
-no public URL, so URL-based reverse engines can't see it. Imify uploads the
-raw bytes to Google's `/searchbyimage/upload` **through proxify** (base64 body
-on `/fetch` — with your cookies + pinned Chrome persona — or the CONNECT
-tunnel). That's the path that can find a face/object photo that exists online
-but has no reachable URL on your side — the same trick TinEye and Google Lens
-use. The result pages are parsed into hits and fed back into your index.
+**Circle-to-Search for images with no online link:** Google retired
+`/searchbyimage/upload`; the live byte-upload path is Google Lens, and Lens
+ties its results to the browser session that uploaded — a plain HTTP upload
+only gets a JavaScript shell back. So Imify asks Proxify's GUI Chrome to do
+the upload itself (`in_page_upload`): it opens `lens.google.com`, submits a
+real form with the image and returns the visual-matches page. Imify parses
+the Lens result records (source page, title, full image, thumbnail) and
+verifies each one like any other candidate. If that path returns nothing,
+the impersonated CONNECT-tunnel upload is tried next, and a zero-match page
+is logged with what came back (size, Lens records present, CAPTCHA).
+`app/engine_guard.py` paces Google uploads (≥12 s apart, daily budget) and
+backs off after a block.
 
 ## Operations
 

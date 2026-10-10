@@ -98,7 +98,9 @@ query image (upload / url / image_id)
            3. Yandex imageview byte-upload — least-censored engine, finds
               face/people matches Google suppresses (strict parser: auth /
               support / tune junk is never emitted as a hit)
-           4. Google searchbyimage / Lens byte-upload — proxify-only
+           4. Google Lens byte-upload — proxify-only: GUI Chrome submits a
+              real upload form on lens.google.com (Lens ties results to
+              the uploading browser session); Lens result records parsed
            5. nothing → degraded[] populated, still local-only
   → VERIFY every web candidate: download it, extract its hashes, compute the
     fused distance to the query. Only fused ≤ near threshold becomes a

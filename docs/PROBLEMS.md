@@ -28,18 +28,25 @@ the FB logo (the most-indexed image on the internet). User: "thats impossible i 
 
 ---
 
-## P2 · Google byte-upload returns 0 hits in 0.3s (shell)  🟡
+## P2 · Google byte-upload returns 0 hits in 0.3s (shell)  ✅ RESOLVED 2026-10-10
 
-**Symptom**: `google-upload reverse` logs `hits=0`; returns in ~0.3s = never actually uploaded/renderered.
+**Symptom**: `google-upload` returned 0 hits — every route got Lens's JavaScript-only shell.
 
-**Root cause**: `app/engines/google_images.py` `_upload_via_fetch` used `"use_browser": False`
-(strategy pipeline = curl_cffi/simple). Google Lens is fully JS-gated → shell back, 0 candidates.
+**Root causes** (three, stacked):
+1. Lens binds results to the browser session that uploaded. Any non-browser upload (curl_cffi
+   tunnel, proxify strategy pipeline, `fetch()` from the Lens UI — cross-origin) gets the shell.
+2. The parser only knew the old Images JSON (`"ou"`/`imgres`), not Lens result records.
+3. Proxify flagged real Google result pages as blocked: its hard-block marker `/sorry/` matched
+   Google's own inline fetch wrapper (`indexOf("/sorry/index")`) → "All strategies exhausted".
 
-**Fix applied (🟡)**: `use_browser: True, force_strategy: "gui_chrome"`, added
-`wait_selector: '.islrc, [class*="islrc"], #yDmH0d img, a[href*="/imgres"]'`, `bypass_cache: True`.
+**Fix**: proxify `/fetch` `in_page_upload` — GUI Chrome opens lens.google.com and submits a real
+`<form>` with the file, returns the raw `/search?vsrid=…` page (proxify `4beae68`); block markers
+are matched outside inline script bodies; Imify `parse_lens_results` extracts
+`["thumb",h,w],["image",h,w] … "2003":[null,id,"page","title"]` records; Google engine tries the
+in-page route first (Imify `70e5b25`, `ac3694e`).
 
-**Verify**: POST `lens.google.com/upload` (multipart, field `encoded_image`) via proxify with browser —
-check for `"ou"` JSON fields or `imgres?imgurl=` links in returned HTML. If captcha/sorry → cookie issue.
+**Verified**: two uncached `/v1/search` runs → 7 and 6 verified `google lens` matches (WSJ, Reuters,
+BBC, PCMag…) in ~18 s; Google not degraded.
 
 ---
 

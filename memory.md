@@ -5,7 +5,7 @@
 > for the exact in-flight debugging state (resume here)**, `docs/ARCHITECTURE.md` for design, and
 > `README.md` for product docs. Update this file after every significant change.
 
-**Last updated**: 2026-10-10 (accuracy overhaul — see §0). Previous: 2026-08-06 (CPU-only policy enforced: NO CUDA/GPU anywhere; AI/face/CLIP merged into /v1/search grid; models2 is NOT live)
+**Last updated**: 2026-10-10 (accuracy overhaul + proxify binary/Lens — see §0 parts 1-4). Previous: 2026-08-06 (CPU-only policy enforced: NO CUDA/GPU anywhere; AI/face/CLIP merged into /v1/search grid; models2 is NOT live)
 **Project root**: `/run/media/irfan/models/imify` (moved here by 2026-10-10; older notes below say `models1`/`models2` — both are GONE. `.env` no longer hard-codes absolute model/cookie paths; defaults resolve from the project root). Previously: `/run/media/irfan/models1/imify` — **THE LIVE ONE** (confirmed by user, who is non-root; `models2/imify` is a root-owned dir with only deploy/reference and is NOT the project — do NOT edit/use it). Old notes saying models2 is live are WRONG.
 **Stack**: Python 3.13 (uv) · FastAPI · StrikeDB (user's own DB, port 6008) · SearXNG (8080) · Proxify (8081 API / 8888 tunnel) · vanilla JS UI · OpenCV FaceDetectorYN+ArcFace · CLIP (ONNX int8) · Real-ESRGAN/BiRefNet (enhance) — **ALL models CPU-only (plain `onnxruntime`, DNN_TARGET_CPU); CUDA/onnxruntime-gpu is banned** (a GPU crash once killed the user's nvidia driver, requiring a reinstall)
 
@@ -81,10 +81,32 @@ Not touched — needs the user's go-ahead (fix the unit's paths to `/run/media/i
   (navigator.webdriver deleted -> undefined, Win32/146 shims), Python TLS MITM, Chrome-for-Testing binary.
   Fix = GUI_HONEST_MODE=true + GUI_TLS_MITM=false + image `proxify-chrome:latest` (official Chrome 155).
   rebrowser bot-detector all green; Google udm=2 search returned real results (no captcha). proxify main = 9fa1a10
-  (local, not pushed). Note: proxify marks Google image pages success=false ("All strategies exhausted") even
-  when the page is real — its quality check likely expects h3 text results.
+  (local, not pushed). (The "Google image pages success=false" quirk noted here is FIXED in part 4.)
 - Profile volume gotcha: stale Chromium SingletonLock from an old container hostname blocks GUI Chrome —
   start_proxify.sh clears it before launch.
+
+**2026-10-10 (part 4) — proxify binary fetch, honest success, Google Lens upload WORKS:**
+- Proxify (reference/proxify `main`, local only: `d98bfa5`, `4beae68`): `/fetch` returns binary responses
+  (images/PDF/zip) as `body_b64` + `content_type` + `size` (PDF text → markdown); `raw=true` returns bytes of
+  text pages and skips DOM cleaning. `success=false` for HTTP 4xx/5xx; 404/410 are final (no escalation);
+  Google udm=2 / Lens pages count as results. Block markers are matched OUTSIDE inline `<script>` bodies —
+  every real Google page's JS contains `/sorry/index`, which flagged raw pages as blocked.
+- **`in_page_upload`** (gui_chrome only): opens `upload_landing`, submits a real `<form>` with the multipart
+  file from `body_b64`, waits for a URL containing `result_url_contains`, returns the page raw. Lens binds
+  results to the uploading browser session — curl/tunnel uploads and `fetch()` (cross-origin) only get a shell.
+- Imify: `app/proxify.py` raw-bytes fallback downloader for refused candidates / `image_url` (403/429…);
+  `parse_lens_results` (Lens "2003" records → page, title, image, thumb); Google engine order = proxify
+  in-page upload → impersonated tunnel; a zero-match page is logged (size / lens records / sorry).
+  Verified: 2 uncached searches → 7 and 6 verified `google lens` matches, ~18 s. Commits `70e5b25`, `ac3694e`.
+- Mounted proxify files (start_proxify.sh, `:ro`): strategies/gui_chrome.py, strategies/base.py,
+  engine/decision_engine.py, **engine/js_challenge_solver.py (new)**, gateway/rest_api.py,
+  scripts/gui_browser.sh. Edit in reference/proxify, then `docker restart proxy-orchestrator`
+  (a newly mounted file needs `scripts/start_proxify.sh --recreate`).
+- Unexplained once: the first Imify search right after a proxify restart got 0 Lens matches; the next two
+  were fine. The new zero-match log line will show what came back if it recurs.
+- **UI ↔ API parity checked:** the web UI only calls `/v1/*` endpoints (no client-only features), so every
+  UI action is scriptable; API-only extras: `/v1/search/face`, `/v1/search/clip`, `mode=exact`,
+  `/v1/admin/clip/backfill`, `/v1/image/{id}`, `/metrics`. README "API" section maps each to its UI control.
 
 ---
 
@@ -169,6 +191,10 @@ Imify = **independent reverse image search** (TinEye / Google Lens / Circle-to-S
 ---
 
 ## 4. THE PROXIFY PATCHES (critical, applied to user's tool)
+
+> **Current (2026-10-10):** checkout = `/run/media/irfan/models/imify/reference/proxify`; the container
+> MOUNTS the patched files (see §0 part 4) — no `docker cp`. The `models1` paths and sync recipe below are
+> historical. API docs: proxify `README.md` ("Agent-Friendly Fetch API") + `docs/API_AND_PROXY.md`.
 
 Proxify checkouts: **reference** `/run/media/irfan/models1/imify/reference/proxify` (source of truth for
 our patches) and **user's main** `~/Backup/searchapi/proxify` (synced by copying files). Container
