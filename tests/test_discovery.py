@@ -222,3 +222,41 @@ def test_chromium_epoch_expiry_is_normalized(tmp_path):
     report = cookie_health(path)["domains"]["facebook.com"]
     assert report["expired"] == 1 and report["live"] == 1
     assert 20 < report["soonest_expiry_h"] < 28
+
+
+# ------------------------------------------------------------ proxify raw
+def test_hotlink_blocked_candidate_is_fetched_through_proxify(ctx, monkeypatch):
+    """A 403 (hotlink protection) no longer loses the candidate: the bytes
+    come back through proxify's raw mode and the match is verified."""
+    import base64
+
+    base = textured(21)
+    raw = jpeg(base)
+    ctx["settings"].proxify_fetch_url = "http://proxify.test"
+
+    class Forbidden:
+        status_code = 403
+        headers = {"content-type": "text/html"}
+        content = b"<html>hotlink denied</html>"
+
+    posts = []
+
+    class ProxifyResp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"success": True, "content_type": "image/jpeg", "final_url": "https://cdn.example/a.jpg",
+                    "body_b64": base64.b64encode(raw).decode()}
+
+    monkeypatch.setattr("app.matcher.httpx.get", lambda url, **k: Forbidden())
+    monkeypatch.setattr("app.proxify.httpx.post", lambda url, json=None, **k: posts.append(json) or ProxifyResp())
+    from app.features import extract_features
+
+    hit = ImageHit(title="x", url="https://site.example/p", img_src="https://cdn.example/a.jpg")
+    out = ctx["matcher"].verify_web_hits(extract_features(base), [hit], budget_seconds=10)
+    assert out[0].match_type in ("exact", "near")
+    assert "proxify" in out[0].resolution and "http-403" in out[0].resolution
+    assert posts and posts[0]["raw"] is True and posts[0]["url"] == "https://cdn.example/a.jpg"

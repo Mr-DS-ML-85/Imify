@@ -324,6 +324,10 @@ class Settings(BaseSettings):
     # ~10s through the single shared Chrome — capping keeps a FB-heavy result
     # set from stalling the whole search.
     web_verify_render_max: int = 4
+    # Candidate downloads refused directly (403 hotlink protection, 429,
+    # anti-bot fronts) are retried through proxify's /fetch raw-bytes mode.
+    # Max such retries per search (each costs a proxify round-trip).
+    web_verify_proxify_max: int = 12
     # --- Bandwidth guards (verification downloads) ---
     # Triage every candidate on the engine's THUMBNAIL (~10 KB) first and
     # download the full image only when the thumbnail is promising (hash

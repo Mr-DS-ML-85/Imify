@@ -181,6 +181,22 @@ curl -s http://127.0.0.1:8081/cookies/status
   docker build -f docker/Dockerfile.proxify-chrome -t proxify-chrome:latest docker/
   scripts/start_proxify.sh --recreate
   ```
+- **Images, PDFs, files, raw URLs:** `/fetch` returns binary responses as
+  bytes. Images, PDFs, archives and anything non-text come back in
+  `body_b64` with `content_type` and `size` (PDF text is also extracted into
+  `markdown`). Add `"raw": true` to get the bytes of a text page too.
+  Imify uses this as its fallback downloader (`app/proxify.py`) when a
+  candidate image or an `image_url` is refused directly (403 hotlink
+  protection, 429, anti-bot fronts).
+
+  ```bash
+  curl -s -X POST http://127.0.0.1:8081/fetch -H 'Content-Type: application/json' \
+    -d '{"url":"https://www.python.org/static/img/python-logo.png"}' \
+    | python3 -c "import json,sys,base64;d=json.load(sys.stdin);open('logo.png','wb').write(base64.b64decode(d['body_b64']));print(d['content_type'],d['size'])"
+  ```
+- **Honest results:** `success` is `false` for HTTP errors (404/410 are
+  returned as final answers instead of being escalated through every
+  strategy), and Google image / Lens result pages count as real results.
 - **Self-check:** fetch `https://bot-detector.rebrowser.net/` through
   proxify's `gui_chrome` and read the verdicts; everything should be green.
 - **Native network stack:** `GUI_TLS_MITM=false` (default in the script)

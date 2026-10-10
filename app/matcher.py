@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
 
+import threading
+
 import httpx
 import numpy as np
 
@@ -72,6 +74,7 @@ def _cache_web_preview(content: bytes, settings: Settings) -> str | None:
     except Exception:  # noqa: BLE001 — preview caching is best-effort
         return ""
 from app.models import MATCH_FAMILY_RANK, ImageMeta, SearchResult
+from app.proxify import fetch_raw
 from app.repo import Repository
 
 
@@ -536,6 +539,24 @@ class Matcher:
                     return content, img_url
             return None, ""
 
+        proxify_raw_left = [self.settings.web_verify_proxify_max]
+        proxify_lock = threading.Lock()
+
+        def via_proxify(url: str, referer: str | None) -> tuple[bytes, str] | None:
+            """Refused directly -> retry through proxify's raw-bytes mode
+            (its TLS-impersonating client / real browser gets past hotlink
+            and anti-bot fronts). Bounded per search."""
+            if not proxify_fetch:
+                return None
+            with proxify_lock:
+                if proxify_raw_left[0] <= 0:
+                    return None
+                proxify_raw_left[0] -= 1
+            content, ctype, final = fetch_raw(proxify_fetch, url, referer=referer or "", timeout=timeout)
+            if content and ctype.lower().startswith("image/") and len(content) <= max_bytes:
+                return content, final
+            return None
+
         def fetch_bytes(
             url: str,
             referer: str | None = None,
@@ -578,6 +599,9 @@ class Matcher:
                     proxy=proxy,
                 )
             except Exception:  # noqa: BLE001
+                via = via_proxify(url, referer)
+                if via is not None:
+                    return via[0], via[1], hops + ["fetch-error", "proxify"]
                 return None, url, hops + ["fetch-error"]
             if resp.status_code >= 400 or not resp.content:
                 # FB CDN signatures expire in minutes -> "Bad URL hash" 403s.
@@ -592,6 +616,10 @@ class Matcher:
                             depth=depth + 1,
                             hops=hops + [f"fb-signature-{resp.status_code}→page"],
                         )
+                if resp.status_code in (401, 403, 405, 429, 451, 503):
+                    via = via_proxify(url, referer)
+                    if via is not None:
+                        return via[0], via[1], hops + [f"http-{resp.status_code}", "proxify"]
                 return None, url, hops + [f"http-{resp.status_code}"]
             ctype = resp.headers.get("content-type", "").lower()
             if ctype.startswith("image/"):

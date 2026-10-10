@@ -25,6 +25,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from app.proxify import fetch_raw
 from app.cookies import CookieFile
 from app.searx import DEFAULT_UA
 
@@ -72,6 +73,15 @@ def resolve_image_bytes(
     proxify = proxify_fetch.rstrip("/") if proxify_fetch else ""
     hops: list[str] = []
 
+    def _via_proxify(target: str, referer: str | None):
+        """Direct fetch refused/failed: proxify raw-bytes mode (images, and
+        HTML pages whose og:image we can still follow)."""
+        content, ctype, final = fetch_raw(proxify, target, referer=referer or "", timeout=timeout)
+        if content and ctype.lower().startswith("image/") and len(content) <= max_bytes:
+            hops.append("proxify")
+            return content, final
+        return None, target
+
     def _fetch(target: str, referer: str | None = None, depth: int = 0):
         nonlocal hops
         if depth > 3:
@@ -95,9 +105,9 @@ def resolve_image_bytes(
                 proxy=proxy or None,
             )
         except Exception:  # noqa: BLE001
-            return None, target
+            return _via_proxify(target, referer)
         if resp.status_code >= 400 or not resp.content:
-            return None, target
+            return _via_proxify(target, referer)
         ctype = resp.headers.get("content-type", "").lower()
         if ctype.startswith("image/"):
             if len(resp.content) > max_bytes:

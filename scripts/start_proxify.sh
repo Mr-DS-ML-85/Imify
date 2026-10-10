@@ -45,7 +45,9 @@ docker run -d --name "$NAME" --network proxy-orchestrator_default \
   -e GUI_TLS_MITM="${GUI_TLS_MITM:-false}" -e GUI_HONEST_MODE="${GUI_HONEST_MODE:-true}" \
   -v "$PWD/reference/proxify/proxy-orchestrator/strategies/gui_chrome.py:/app/strategies/gui_chrome.py:ro" \
   -v "$PWD/reference/proxify/proxy-orchestrator/scripts/gui_browser.sh:/app/scripts/gui_browser.sh:ro" \
-  -v "$PWD/reference/proxify/proxy-orchestrator/engine/decision_engine.py:/app/engine/decision_engine.py:ro" -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright -e TZ="$HOST_TZ" \
+  -v "$PWD/reference/proxify/proxy-orchestrator/engine/decision_engine.py:/app/engine/decision_engine.py:ro" \
+  -v "$PWD/reference/proxify/proxy-orchestrator/strategies/base.py:/app/strategies/base.py:ro" \
+  -v "$PWD/reference/proxify/proxy-orchestrator/gateway/rest_api.py:/app/gateway/rest_api.py:ro" -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright -e TZ="$HOST_TZ" \
   -v proxify-gui-profile:/app/gui-profile \
   $( [ -f "$COOKIES" ] && echo "-v $COOKIES:/app/gui-cookies.txt:ro -e COOKIE_FILE=/app/gui-cookies.txt" ) \
   --shm-size 1g --init --restart unless-stopped "$IMAGE" >/dev/null

@@ -2,6 +2,7 @@
 # Playwright's Chromium is "Chrome for Testing": navigator.userAgentData has no
 # "Google Chrome" brand, a well-known automation-browser marker. Real users run
 # branded Chrome — so does the GUI browser now. Base image is unchanged.
+# pypdf: /fetch returns PDF text as markdown alongside the raw bytes.
 FROM proxy-orchestrator-orchestrator:latest
 USER root
 RUN apt-get update \
@@ -10,4 +11,6 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends /tmp/chrome.deb \
  && rm -f /tmp/chrome.deb \
  && rm -rf /var/lib/apt/lists/* \
- && google-chrome-stable --version
+ && google-chrome-stable --version \
+ && pip install --no-cache-dir "pypdf>=4" \
+ && python3 -c "import pypdf; print('pypdf', pypdf.__version__)"
