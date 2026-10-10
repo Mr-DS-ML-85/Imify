@@ -127,7 +127,7 @@ def test_google_upload_requires_proxify():
 
 
 def test_google_upload_via_fetch_body_b64(monkeypatch):
-    """Primary path: binary multipart through proxify /fetch as base64 body."""
+    """Primary path: proxify GUI Chrome submits the file as a real in-page form."""
     captured = {}
 
     def fake_post(url, json, timeout):
@@ -150,13 +150,13 @@ def test_google_upload_via_fetch_body_b64(monkeypatch):
 
     assert captured["url"] == "http://127.0.0.1:8081/fetch"
     j = captured["json"]
-    assert j["url"] == "https://lens.google.com/upload"
+    assert j["url"].startswith("https://lens.google.com/v3/upload?")
     assert j["method"] == "POST"
-    # Google Lens is fully JS-gated — the browser (gui_chrome, session
-    # cookies) is REQUIRED so the visual-similar results actually render.
-    assert j["use_browser"] is True
+    # Lens results are bound to the browser session that uploaded: the GUI
+    # Chrome must do the upload itself, from the Lens page.
     assert j["force_strategy"] == "gui_chrome"
-    assert "islrc" in j["wait_selector"]
+    assert j["in_page_upload"] is True
+    assert j["upload_landing"] == "https://lens.google.com/"
     import base64
 
     decoded = base64.b64decode(j["body_b64"])

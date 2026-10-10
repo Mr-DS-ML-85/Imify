@@ -46,6 +46,7 @@ docker run -d --name "$NAME" --network proxy-orchestrator_default \
   -v "$PWD/reference/proxify/proxy-orchestrator/strategies/gui_chrome.py:/app/strategies/gui_chrome.py:ro" \
   -v "$PWD/reference/proxify/proxy-orchestrator/scripts/gui_browser.sh:/app/scripts/gui_browser.sh:ro" \
   -v "$PWD/reference/proxify/proxy-orchestrator/engine/decision_engine.py:/app/engine/decision_engine.py:ro" \
+  -v "$PWD/reference/proxify/proxy-orchestrator/engine/js_challenge_solver.py:/app/engine/js_challenge_solver.py:ro" \
   -v "$PWD/reference/proxify/proxy-orchestrator/strategies/base.py:/app/strategies/base.py:ro" \
   -v "$PWD/reference/proxify/proxy-orchestrator/gateway/rest_api.py:/app/gateway/rest_api.py:ro" -e PLAYWRIGHT_BROWSERS_PATH=/ms-playwright -e TZ="$HOST_TZ" \
   -v proxify-gui-profile:/app/gui-profile \

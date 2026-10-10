@@ -194,6 +194,13 @@ curl -s http://127.0.0.1:8081/cookies/status
     -d '{"url":"https://www.python.org/static/img/python-logo.png"}' \
     | python3 -c "import json,sys,base64;d=json.load(sys.stdin);open('logo.png','wb').write(base64.b64decode(d['body_b64']));print(d['content_type'],d['size'])"
   ```
+- **In-browser uploads (Google Lens):** a `POST` with a multipart file in
+  `body_b64`, `"force_strategy": "gui_chrome"` and `"in_page_upload": true`
+  is uploaded by the GUI Chrome itself: it opens `upload_landing`, submits a
+  real form with the file, waits for a URL containing `result_url_contains`
+  (default `/search`) and returns that page's raw HTML (scripts kept). Lens
+  ties its results to the browser session that uploaded, so this is the one
+  route that returns visual matches; Imify's Google engine uses it first.
 - **Honest results:** `success` is `false` for HTTP errors (404/410 are
   returned as final answers instead of being escalated through every
   strategy), and Google image / Lens result pages count as real results.

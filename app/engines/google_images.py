@@ -13,6 +13,7 @@ from __future__ import annotations
 import base64
 import html as html_mod
 import re
+import time
 import urllib.parse
 from typing import Any
 
@@ -29,6 +30,8 @@ SEARCH_URL = "https://www.google.com/searchbyimage"
 # the live byte-upload path is Google Lens: POST multipart -> 303 redirect to
 # a /search?udm=26 visual-results page carrying the session token.
 UPLOAD_URL = "https://lens.google.com/upload"
+# What the Lens web UI itself posts to (form submit from lens.google.com)
+LENS_FORM_UPLOAD_URL = "https://lens.google.com/v3/upload?hl=en&re=df&st={st}&ep=gsbubb"
 DESKTOP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
@@ -103,35 +106,46 @@ class GoogleImagesReverse:
         The one path that works for images with NO publicly reachable URL.
         Routing, in order:
 
-        1. curl_cffi chrome146 impersonation — via the proxify CONNECT tunnel
-           when configured, else direct. This is the path that beats Google's
-           TLS-level datacenter block (a real chrome146 ClientHello is the
-           difference between a SERP and a /sorry page);
-        2. proxify /fetch (base64 body) — full strategy pipeline: pinned
-           Chrome persona, your real session cookies, browser render;
-        3. direct httpx — only when impersonation is unavailable.
+        1. proxify in-page upload — the GUI Chrome opens Lens and submits a
+           real upload form, so the results page is rendered in the same
+           browser session that made the upload (the only path that returns
+           visual matches: Lens serves bare HTTP clients a JS-only shell);
+        2. curl_cffi chrome146 impersonation — via the proxify CONNECT tunnel
+           when configured, else direct.
 
-        Returns parsed visual-similar results from the Lens /search?udm=26 page.
+        A path whose page parses to zero matches falls through to the next.
+        Returns parsed visual matches (source page + image) from Lens.
         """
         body, boundary = _build_multipart(image_bytes, filename, content_type)
         errors: list[str] = []
         direct = self.direct_upload if direct_upload is None else direct_upload
+        if self.proxify_fetch_url:
+            try:
+                hits = self._finish_upload(self._upload_via_fetch(body, boundary), len(image_bytes), via="proxify-in-page")
+                if hits:
+                    return hits
+                errors.append("proxify: no matches parsed")
+            except EngineError as exc:
+                errors.append(f"proxify: {exc}")
         if self.fetch_proxy_url or (direct and _impersonating_session(None) is not None):
             try:
                 page = self._upload_via_tunnel(body, boundary, proxy=self.fetch_proxy_url or None)
-                return self._finish_upload(page, len(image_bytes), via="impersonated-tunnel" if self.fetch_proxy_url else "impersonated-direct")
+                hits = self._finish_upload(page, len(image_bytes), via="impersonated-tunnel" if self.fetch_proxy_url else "impersonated-direct")
+                if hits:
+                    return hits
+                errors.append("impersonation: no matches parsed")
             except EngineError as exc:
                 errors.append(f"impersonation: {exc}")
-        if self.proxify_fetch_url:
-            try:
-                page = self._upload_via_fetch(body, boundary)
-                return self._finish_upload(page, len(image_bytes), via="proxify")
-            except EngineError as exc:
-                errors.append(f"proxify: {exc}")
         raise EngineError("google-upload failed via all paths: " + "; ".join(errors))
 
     def _finish_upload(self, page: str, size: int, via: str) -> list[ImageHit]:
         hits = parse_google_results(page)
+        if not hits:
+            # Say WHAT came back — a shell, a captcha, or an unparsed layout
+            log.warning(
+                f"google-upload {via}: 0 matches from a {len(page or '')}-char page "
+                f"(lens records: {'\"2003\"' in (page or '')}, sorry: {'/sorry/index?' in (page or '')})"
+            )
         log.info(
             "google-upload reverse",
             extra={"event": "google_upload_reverse", "via": via, "bytes": size, "hits": len(hits)},
@@ -139,31 +153,27 @@ class GoogleImagesReverse:
         return hits
 
     def _upload_via_fetch(self, body: bytes, boundary: str) -> str:
-        """Binary upload through proxify /fetch (cookies + TLS impersonation)."""
+        """Upload through proxify's GUI Chrome as a real in-page form submit."""
         try:
             resp = httpx.post(
                 self.proxify_fetch_url + "/fetch",
                 json={
-                    "url": UPLOAD_URL,
+                    "url": LENS_FORM_UPLOAD_URL.format(st=int(time.time() * 1000)),
                     "method": "POST",
                     "body_b64": base64.b64encode(body).decode("ascii"),
-                    "headers": {
-                        "Content-Type": f"multipart/form-data; boundary={boundary}",
-                        "Accept-Language": "en-US,en;q=0.9",
-                        "Referer": "https://www.google.com/",
-                    },
-                    # Google Lens is fully JS-gated — the upload POST returns a
-                    # shell and the visual-similar results only exist after JS
-                    # renders them. Force the real browser (gui_chrome, session
-                    # cookies) and wait for the results grid so the returned
-                    # page actually carries candidates.
-                    "timeout": 45,
-                    "use_browser": True,
+                    "headers": {"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                    # Lens results are bound to the browser session that made
+                    # the upload: proxify's GUI Chrome opens Lens and submits a
+                    # real form with the file, then returns the raw results
+                    # page (matches live in its <script> JSON).
+                    "timeout": 60,
                     "force_strategy": "gui_chrome",
-                    "wait_selector": '.islrc, [class*="islrc"], #yDmH0d img, a[href*="/imgres"]',
+                    "in_page_upload": True,
+                    "upload_landing": "https://lens.google.com/",
+                    "result_url_contains": "/search",
                     "bypass_cache": True,
                 },
-                timeout=90,
+                timeout=120,
             )
             resp.raise_for_status()
             data = resp.json()
