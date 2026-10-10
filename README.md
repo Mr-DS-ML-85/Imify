@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="docs/logo.svg" alt="Imify — self-hosted reverse image search" width="640"/>
+</p>
+
+<p align="center">
   <b>Imify — self-hosted reverse image search.</b><br/>
   Your own image index, built by your own pipeline. SearXNG for discovery, StrikeDB for storage + vector search. No third-party APIs, no per-query fees, no data leaving your infrastructure.
 </p>
