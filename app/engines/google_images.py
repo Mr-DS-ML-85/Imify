@@ -270,6 +270,52 @@ def _decode(s: str) -> str:
         return s
 
 
+# Lens / Images result record embedded in the page's JSON:
+#   ["<thumb>",h,w],["<full image>",h,w], … ,"2003":[null,"<id>","<page>","<title>", …
+_LENS_RECORD = re.compile(
+    r'\["(https://encrypted-tbn\d\.gstatic\.com/images\?[^"]+)",\d+,\d+\],'
+    r'\["(https?://[^"]+)",(\d+),(\d+)\]'
+    r'.{0,60}?"2003":\[null,"[^"]*","(https?://[^"]+)","((?:[^"\\]|\\.)*)"',
+    re.S,
+)
+
+
+def _json_str(s: str) -> str:
+    """Decode a JSON string body (\\u003d -> '=', \\u0026 -> '&', \\" ...)."""
+    import json
+
+    try:
+        return json.loads(f'"{s}"')
+    except ValueError:
+        return s.replace("\\u003d", "=").replace("\\u0026", "&")
+
+
+def parse_lens_results(page: str) -> list[ImageHit]:
+    """Google Lens visual matches: every record carries the SOURCE PAGE, its
+    title, the full-size image and Google's thumbnail — what the verifier
+    needs (a bare image URL without its page is dropped as unlinkable)."""
+    hits: list[ImageHit] = []
+    seen: set[str] = set()
+    for m in _LENS_RECORD.finditer(page or ""):
+        thumb, img, h, w, page_url, title = (
+            _json_str(m.group(1)), _json_str(m.group(2)), m.group(3), m.group(4),
+            _json_str(m.group(5)), _json_str(m.group(6)),
+        )
+        if img in seen or "gstatic.com" in img:
+            continue
+        seen.add(img)
+        hits.append(ImageHit(
+            title=title.strip() or page_url,
+            url=page_url,
+            img_src=img,
+            thumbnail_src=thumb,
+            engine="google lens",
+            width=int(w),
+            height=int(h),
+        ))
+    return hits
+
+
 def parse_google_results(page: str) -> list[ImageHit]:
     """Tolerant parser for the Google Images reverse-search page.
 
@@ -279,6 +325,10 @@ def parse_google_results(page: str) -> list[ImageHit]:
     placeholders, the captcha/blocked page) are NOT results — they are filtered
     hard so a blocked or logo-only page can never be parsed into candidates.
     """
+    # Lens visual-match records first: they carry the real source pages
+    lens = parse_lens_results(page)
+    if lens:
+        return lens
     hits: list[ImageHit] = []
     seen: set[str] = set()
 

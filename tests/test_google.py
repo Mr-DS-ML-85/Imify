@@ -302,3 +302,23 @@ def test_chain_sequential_mode_keeps_order():
     # sequential mode merges every provider's hits too (TinEye aggregation)
     assert {h.img_src for h in hits} == {"https://s/x.jpg", "https://g/x.jpg"}
     assert degraded == []
+
+
+def test_lens_visual_matches_carry_source_pages():
+    """Lens result records: thumbnail, full image, then the source page +
+    title in a "2003" record; escapes (\\u003d, \\u0026) decoded."""
+    from app.engines.google_images import parse_google_results
+
+    rec = (
+        '["https://encrypted-tbn0.gstatic.com/images?q\\u003dtbn:ABC",168,300],'
+        '["https://cdn.example.com/photo.jpg?w\\u003d1920\\u0026h\\u003d1080",1080,1920],null,0,'
+        '{"22":0,"2003":[null,"id1","https://news.example.com/story","A \\"quoted\\" title",null]}'
+    )
+    hits = parse_google_results("<script>" + rec + "</script>")
+    assert len(hits) == 1
+    h = hits[0]
+    assert h.img_src == "https://cdn.example.com/photo.jpg?w=1920&h=1080"
+    assert h.url == "https://news.example.com/story"
+    assert h.title == 'A "quoted" title'
+    assert h.thumbnail_src.startswith("https://encrypted-tbn0.gstatic.com/images?q=tbn:")
+    assert (h.width, h.height) == (1920, 1080) and h.engine == "google lens"
