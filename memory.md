@@ -77,6 +77,12 @@ Not touched — needs the user's go-ahead (fix the unit's paths to `/run/media/i
   network — the user's ORIGINAL Aug-4 setup had no MITM) → it is an IP-level flag; only quiet time clears it.
   Dropped proxify stashes pinned as branches `recovered/stash-*` in reference/proxify (branch native-network-stealth
   holds the gui_chrome/gui_browser/brave_cookies fixes, not pushed).
+- **RESOLVED 2026-10-10:** it was NOT an IP flag (host browser on same IP was fine). Causes: injected stealth JS
+  (navigator.webdriver deleted -> undefined, Win32/146 shims), Python TLS MITM, Chrome-for-Testing binary.
+  Fix = GUI_HONEST_MODE=true + GUI_TLS_MITM=false + image `proxify-chrome:latest` (official Chrome 155).
+  rebrowser bot-detector all green; Google udm=2 search returned real results (no captcha). proxify main = 9fa1a10
+  (local, not pushed). Note: proxify marks Google image pages success=false ("All strategies exhausted") even
+  when the page is real — its quality check likely expects h3 text results.
 - Profile volume gotcha: stale Chromium SingletonLock from an old container hostname blocks GUI Chrome —
   start_proxify.sh clears it before launch.
 
